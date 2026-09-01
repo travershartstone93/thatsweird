@@ -1,0 +1,5012 @@
+#!/usr/bin/env python3
+"""
+weird - Process Anomaly Detector
+
+Identifies suspicious processes by:
+- Detecting processes with unusual names or behavior
+- Verifying package provenance (binary -> package -> repo -> signing key)
+- Inspecting ambiguous processes to understand what they're doing
+- Checking if flagged PIDs have network connections
+"""
+
+import argparse
+import glob
+import json
+import os
+import pwd
+import re
+import ipaddress
+import shutil
+import struct
+import subprocess
+import sys
+import socket
+try:
+    import tomllib  # Python 3.11+
+except Exception:
+    tomllib = None
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Set
+import hashlib
+import time
+
+
+# =============================================================================
+# Constants and Configuration
+# =============================================================================
+
+CONFIG_DIR = Path.home() / ".config" / "weird"
+CACHE_DIR = CONFIG_DIR / "cache"
+CACHE_FILE = CACHE_DIR / "file_package_map.json"
+USER_TRUSTED_FILE = CONFIG_DIR / "user_trusted.txt"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+BASELINE_FILE = CONFIG_DIR / "baseline.json"
+RULES_FILE = CONFIG_DIR / "rules.toml"
+DESC_CACHE_FILE = CONFIG_DIR / "desc_cache.json"
+DESC_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
+DESC_CACHE_NEGATIVE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+
+# Known DoH/DoT endpoints to exclude from raw IP penalties
+DOH_DOT_ENDPOINTS = {
+    "1.1.1.1", "1.0.0.1",           # Cloudflare
+    "8.8.8.8", "8.8.4.4",           # Google
+    "9.9.9.9", "149.112.112.112",   # Quad9
+    "208.67.222.222", "208.67.220.220",  # OpenDNS
+    "94.140.14.14", "94.140.15.15",      # AdGuard
+}
+
+# Official distro keyrings
+OFFICIAL_KEYRINGS = [
+    "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
+    "/usr/share/keyrings/pop-archive-keyring.gpg",
+    "/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg",
+    "/etc/apt/trusted.gpg.d/ubuntu-keyring-2012-cdimage.gpg",
+    "/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg",
+]
+
+# Known interpreter binaries
+INTERPRETERS = {
+    "python", "python2", "python3", "python3.8", "python3.9", "python3.10",
+    "python3.11", "python3.12", "ruby", "perl", "node", "nodejs", "php",
+    "bash", "sh", "zsh", "fish", "dash",
+}
+
+# Known legitimate process names that might look random but aren't
+# This reduces false positives from the random-name heuristic
+LEGITIMATE_RANDOM_LOOKING = {
+    # System processes
+    "gvfsd", "gvfs", "gnvs", "gdm", "gdm3", "sshd", "sddm", "lvmpolld",
+    "lvmetad", "mdadm", "mdmon", "ntpd", "rsyslogd", "syslogd", "crond",
+    "atd", "cupsd", "smbd", "nmbd", "winbindd", "sssd", "nscd",
+    # Desktop/UI
+    "xfwm4", "xfce4", "xfdesktop", "xfsettingsd", "xfconfd",
+    "kwin", "plasmashell", "kded5", "kded4", "kdeinit5", "kdeinit4",
+    "gnome-shell", "gsd", "gnome-keyring-daemon",
+    # Development
+    "npm", "npx", "nvm", "nvim", "vim", "tmux", "htop", "btop",
+    # Containers/VMs
+    "containerd", "dockerd", "podman", "qemu", "libvirtd", "virtlogd",
+    # Audio/Video
+    "pipewire", "wireplumber", "pulseaudio", "alsa",
+}
+
+# Legitimate memfd patterns - these are normal and should not be flagged
+# Pattern matching is done with startswith() for efficiency
+LEGITIMATE_MEMFD_PATTERNS = {
+    # Qt/KDE JIT compilation
+    "JITCode:", "JSGCHeap:", "JSVMStack:", "unknown-usage:QtQml",
+    # Audio/video shared memory
+    "pipewire-memfd:", "pulseaudio",
+    # Wayland/display compositors
+    "kwin-", "gdk-wayland", "wayland-shm", "wayland-cursor",
+    "xwayland-shared", "wl_shm", "mutter",
+    # System services
+    "dbus-broker-log",
+}
+
+# Processes known to use JIT compilation heavily - be lenient with anonymous exec
+JIT_HEAVY_PROCESSES = {
+    "plasmashell", "kwin", "kwin_wayland", "kwin_x11",
+    "firefox", "firefox-esr", "chrome", "chromium", "chromium-browser",
+    "node", "nodejs", "java", "electron",
+    "qmlscene", "qml", "plasmoidviewer",
+}
+
+# Legitimate cache paths that should not trigger suspicious path detection
+LEGITIMATE_CACHE_PATHS = {
+    "/.cache/google-chrome/",
+    "/.cache/chromium/",
+    "/.cache/mozilla/",
+    "/.cache/mesa_shader_cache/",
+    "/.cache/fontconfig/",
+    "/.cache/babl/",
+    "/.cache/gegl-0.4/",
+    "/.cache/gstreamer-1.0/",
+    "/.cache/thumbnails/",
+    "/.cache/icon-cache.kcache",
+    "/.cache/ksycoca",
+    "/.cache/kcrash-metadata/",
+    "/.cache/plasmashell/",
+}
+
+# Known IDE/development parent processes - bare interpreters under these are normal
+IDE_PARENT_PROCESSES = {
+    "code", "code-oss", "vscodium",  # VS Code variants
+    "pycharm", "idea", "webstorm", "phpstorm", "clion", "goland",  # JetBrains
+    "jupyter", "jupyter-lab", "jupyter-notebook",  # Jupyter
+    "spyder", "idle", "thonny",  # Python IDEs
+    "rstudio",  # R IDE
+    "emacs", "vim", "nvim", "neovim",  # Editors that run code
+    "gnome-terminal", "konsole", "xterm", "alacritty", "kitty", "wezterm",  # Terminals
+    "tmux", "screen",  # Terminal multiplexers
+}
+
+# Official Arch Linux and derivative repositories - these have signed package databases
+# Packages from these repos can be trusted even without per-package signature verification
+PACMAN_OFFICIAL_REPOS = {
+    # Arch Linux
+    "core", "extra", "multilib",
+    "core-testing", "extra-testing", "multilib-testing",
+    "gnome-unstable", "kde-unstable",
+    # CachyOS
+    "cachyos", "cachyos-v3", "cachyos-v4", "cachyos-core-v3", "cachyos-core-v4",
+    "cachyos-extra-v3", "cachyos-extra-v4",
+    # EndeavourOS
+    "endeavouros",
+    # Manjaro
+    "manjaro-stable", "manjaro-testing", "manjaro-unstable",
+}
+
+# Debug logging file (set via --debug-log or WEIRD_DEBUG_LOG env var)
+DEBUG_LOG_FILE: Optional[Path] = None
+
+# =============================================================================
+# Logging Infrastructure
+# =============================================================================
+
+def debug_log(category: str, message: str) -> None:
+    """
+    Log debug messages for troubleshooting silent failures.
+    Only logs if DEBUG_LOG_FILE is set (via --debug-log flag or WEIRD_DEBUG_LOG env).
+    """
+    global DEBUG_LOG_FILE
+
+    # Check env var if not already set
+    if DEBUG_LOG_FILE is None:
+        env_log = os.environ.get("WEIRD_DEBUG_LOG")
+        if env_log:
+            DEBUG_LOG_FILE = Path(env_log)
+        else:
+            return  # No debug logging configured
+
+    if DEBUG_LOG_FILE:
+        try:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(DEBUG_LOG_FILE, "a") as f:
+                f.write(f"[{timestamp}] [{category}] {message}\n")
+        except (IOError, PermissionError):
+            pass  # Don't fail on log errors
+
+
+# =============================================================================
+# Signals: Path Normalization and Security Checks
+# =============================================================================
+
+def normalize_exe_path(path: str) -> str:
+    """Normalize executable path by removing '(deleted)' suffix."""
+    if path:
+        return path.replace(" (deleted)", "")
+    return path
+
+
+def normalize_cmdline(cmdline: str) -> str:
+    """Normalize cmdline whitespace for stable keys/output."""
+    if not cmdline:
+        return ""
+    return " ".join(cmdline.split())
+
+
+# Allowed base directories for symlink resolution
+# Symlinks that resolve outside these are suspicious
+ALLOWED_SYMLINK_BASES = (
+    "/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/etc/",
+    "/opt/", "/var/lib/", "/snap/", "/home/", "/root/",
+)
+
+
+def safe_realpath(path: str, base_dirs: Optional[Tuple[str, ...]] = None) -> Optional[str]:
+    """
+    Safely resolve a symlink, validating the resolved path.
+
+    Returns the resolved path if it's within allowed directories,
+    or None if the path escapes to unexpected locations.
+
+    This prevents symlink attacks where an attacker creates symlinks
+    pointing to sensitive locations outside expected directories.
+    """
+    if not path:
+        return None
+
+    allowed = base_dirs or ALLOWED_SYMLINK_BASES
+
+    try:
+        resolved = os.path.realpath(path)
+
+        # Check if resolved path is within allowed directories
+        if any(resolved.startswith(base) for base in allowed):
+            return resolved
+
+        # Also allow the original path's directory
+        original_dir = os.path.dirname(os.path.abspath(path))
+        if resolved.startswith(original_dir):
+            return resolved
+
+        # Log suspicious symlink resolution
+        debug_log("symlink_escape", f"Symlink {path} -> {resolved} escapes allowed directories")
+        return None
+
+    except (OSError, ValueError) as e:
+        debug_log("symlink_error", f"Failed to resolve {path}: {e}")
+        return None
+
+
+def is_exe_deleted(pid: int) -> bool:
+    """Check if a process's executable has been deleted from disk."""
+    try:
+        exe_link = f"/proc/{pid}/exe"
+        target = os.readlink(exe_link)
+        return "(deleted)" in target
+    except (OSError, PermissionError):
+        return False
+
+
+def _is_legitimate_memfd(memfd_name: str) -> bool:
+    """Check if a memfd name matches known legitimate patterns."""
+    # Extract the name part from memfd path (e.g., "/memfd:JITCode:QtQml (deleted)" -> "JITCode:QtQml")
+    name = memfd_name
+    if "/memfd:" in name:
+        name = name.split("/memfd:", 1)[1]
+    elif "memfd:" in name:
+        name = name.split("memfd:", 1)[1]
+    # Remove " (deleted)" suffix if present
+    name = name.replace(" (deleted)", "").strip()
+
+    # Check against legitimate patterns (using startswith for pattern matching)
+    for pattern in LEGITIMATE_MEMFD_PATTERNS:
+        if name.startswith(pattern) or pattern in name:
+            return True
+    return False
+
+
+def _get_process_name(pid: int) -> str:
+    """Get process name for a given PID."""
+    try:
+        comm_path = f"/proc/{pid}/comm"
+        with open(comm_path) as f:
+            return f.read().strip().lower()
+    except (IOError, PermissionError):
+        return ""
+
+
+def is_memfd_or_anonymous(pid: int) -> Tuple[bool, List[str]]:
+    """
+    Check if process is running from memfd_create or anonymous memory.
+    This is a common malware technique to run code without a file on disk.
+
+    Returns: (is_suspicious, evidence_list)
+    """
+    evidence = []
+    suspicious = False
+
+    # Get process name for JIT-heavy process check
+    proc_name = _get_process_name(pid)
+    is_jit_heavy = proc_name in JIT_HEAVY_PROCESSES
+
+    # Check /proc/pid/exe for memfd
+    try:
+        exe_link = f"/proc/{pid}/exe"
+        target = os.readlink(exe_link)
+
+        # memfd_create executables show as /memfd:name (deleted)
+        if "/memfd:" in target or "memfd:" in target:
+            # Check if this is a legitimate memfd pattern
+            if not _is_legitimate_memfd(target):
+                evidence.append(f"Executing from memfd: {target}")
+                suspicious = True
+
+        # Check for /proc/self/fd/ execution trick
+        if "/proc/self/fd/" in target or f"/proc/{pid}/fd/" in target:
+            evidence.append(f"Executing from /proc fd: {target}")
+            suspicious = True
+
+        # Check for /dev/shm execution
+        if target.startswith("/dev/shm/"):
+            evidence.append(f"Executing from /dev/shm: {target}")
+            suspicious = True
+
+    except (OSError, PermissionError):
+        pass
+
+    # Check /proc/pid/maps for anonymous executable regions
+    # Skip this check entirely for known JIT-heavy processes to reduce noise
+    if not is_jit_heavy:
+        try:
+            maps_path = f"/proc/{pid}/maps"
+            with open(maps_path) as f:
+                for line in f:
+                    # Look for executable anonymous mappings
+                    # Format: addr perms offset dev inode pathname
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        perms = parts[1]
+                        # Check for executable (x) anonymous mappings with no file
+                        if 'x' in perms:
+                            if len(parts) == 5:
+                                # No pathname = anonymous - but this is normal for many processes
+                                # Only flag if we haven't already found evidence
+                                # Skip this heuristic as it's too noisy (JIT, VDSO, etc.)
+                                pass
+                            elif len(parts) >= 6:
+                                pathname = parts[5]
+                                # Skip known safe kernel mappings
+                                if pathname in ("[vdso]", "[vsyscall]", "[heap]", "[stack]"):
+                                    continue
+                                # Check for memfd in maps
+                                if "memfd:" in line:
+                                    # Extract memfd name from the line
+                                    memfd_match = line.split("memfd:", 1)
+                                    if len(memfd_match) > 1:
+                                        memfd_name = "memfd:" + memfd_match[1].strip()
+                                        if not _is_legitimate_memfd(memfd_name):
+                                            evidence.append(f"memfd executable mapping: {pathname}")
+                                            suspicious = True
+                                            break
+        except (IOError, PermissionError):
+            pass
+
+    return suspicious, evidence
+
+
+def check_elf_sanity(path: str) -> Tuple[bool, str]:
+    """
+    Basic ELF header sanity check.
+    Returns: (is_suspicious, reason)
+    """
+    if not path or not os.path.exists(path):
+        return False, ""
+
+    try:
+        with open(path, "rb") as f:
+            ident = f.read(16)
+            if len(ident) < 16 or ident[:4] != b"\x7fELF":
+                return False, ""
+
+            elf_class = ident[4]  # 1=32-bit, 2=64-bit
+            if elf_class == 2:
+                hdr = f.read(64 - 16)
+                if len(hdr) < (64 - 16):
+                    return False, ""
+                shnum = struct.unpack_from("<H", ident + hdr, 0x3E)[0]
+            elif elf_class == 1:
+                hdr = f.read(52 - 16)
+                if len(hdr) < (52 - 16):
+                    return False, ""
+                shnum = struct.unpack_from("<H", ident + hdr, 0x30)[0]
+            else:
+                return False, ""
+
+            # Suspicious: very few sections (possibly packed/stripped maliciously)
+            # or absurdly many sections
+            if shnum < 2:
+                return True, f"Suspicious ELF: only {shnum} sections (possibly packed)"
+            if shnum > 200:
+                return True, f"Suspicious ELF: {shnum} sections (abnormal)"
+
+    except (IOError, PermissionError, ValueError, struct.error):
+        pass
+
+    return False, ""
+
+
+def is_suspicious_path(path: str) -> bool:
+    """Return True if path is in a known suspicious location."""
+    if not path:
+        return False
+
+    # Check if path matches a legitimate cache path (allowlist)
+    for legitimate_path in LEGITIMATE_CACHE_PATHS:
+        if legitimate_path in path:
+            return False
+
+    policy = load_policy()
+    prefixes = policy["signals"].get("suspicious_paths_prefix", [])
+    contains = policy["signals"].get("suspicious_paths_contains", [])
+    if prefixes and path.startswith(tuple(prefixes)):
+        return True
+    for needle in contains:
+        if needle in path:
+            return True
+    return False
+
+
+def build_process_key(proc: "ProcessInfo") -> str:
+    """Stable key for grouping/diffing processes."""
+    realpath = os.path.realpath(proc.path) if proc.path else ""
+    cmd = normalize_cmdline(proc.cmdline)
+    return f"{realpath}|{proc.uid}|{proc.ppid}|{cmd}"
+
+
+def get_parent_chain_fingerprint(pid: int, max_depth: int = 6) -> str:
+    """Best-effort parent chain fingerprint up to init/systemd."""
+    parts = []
+    current = pid
+    depth = 0
+    while current > 1 and depth < max_depth:
+        try:
+            status_path = Path(f"/proc/{current}/status")
+            ppid = 0
+            name = ""
+            if status_path.exists():
+                for line in status_path.read_text().splitlines():
+                    if line.startswith("Name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+            exe_path = ""
+            try:
+                exe_path = os.readlink(f"/proc/{current}/exe")
+                exe_path = normalize_exe_path(exe_path)
+            except (OSError, PermissionError):
+                exe_path = ""
+            parts.append(f"{name}:{exe_path}")
+            if ppid <= 1:
+                break
+            current = ppid
+            depth += 1
+        except (OSError, ValueError):
+            break
+    return " <- ".join(parts)
+
+
+def get_parent_name(pid: int) -> str:
+    """Return parent process name via /proc (best-effort)."""
+    try:
+        status_path = Path(f"/proc/{pid}/status")
+        if status_path.exists():
+            for line in status_path.read_text().splitlines():
+                if line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+                    comm_path = Path(f"/proc/{ppid}/comm")
+                    if comm_path.exists():
+                        return comm_path.read_text().strip()
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def hash_file(path: str) -> str:
+    """Compute sha256 of a file (best-effort)."""
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except (OSError, PermissionError):
+        return ""
+
+
+def sanitize_cmdline(cmdline: str) -> str:
+    """Redact obvious secrets from cmdline for logging."""
+    if not cmdline:
+        return ""
+    redacted = []
+    for part in cmdline.split():
+        if any(tok in part.lower() for tok in ["token=", "password=", "secret=", "apikey=", "api_key="]):
+            key = part.split("=", 1)[0]
+            redacted.append(f"{key}=REDACTED")
+        else:
+            redacted.append(part)
+    return " ".join(redacted)
+
+
+def log_event(path: str, msg: str) -> None:
+    """Append a log line to a file."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        with open(path, "a") as f:
+            f.write(f"{ts} {msg}\n")
+    except (OSError, PermissionError):
+        pass
+
+
+def _try_man_page(name: str) -> Optional[subprocess.CompletedProcess]:
+    """Try to fetch a man page for the given name."""
+    if not name or len(name) < 2:
+        return None
+    try:
+        result = subprocess.run(
+            ["man", "-P", "cat", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "MANWIDTH": "80", "LANG": "C"}
+        )
+        if result.returncode == 0:
+            return result
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
+
+
+def get_man_page_description(proc_name: str) -> Optional[str]:
+    """
+    Get the NAME/DESCRIPTION section from a process's man page.
+    Returns a brief description if available, None otherwise.
+    """
+    if not proc_name:
+        return None
+
+    # Clean up process name (remove parentheses, paths, etc.)
+    base_name = proc_name.strip("()").split("/")[-1]
+    # Remove common suffixes like .py, .sh
+    base_name = re.sub(r'\.(py|sh|pl|rb)$', '', base_name)
+
+    # Try multiple name variants in order of preference:
+    # 1. Original name (e.g., kded6, fusermount3, python3)
+    # 2. Name with trailing version numbers stripped (e.g., kded, fusermount, python)
+    # 3. Name with hyphenated version stripped (e.g., python3.12 -> python3 -> python)
+    name_variants = [base_name]
+
+    # Add version-stripped variant if different
+    stripped_name = re.sub(r'[0-9.]+$', '', base_name)
+    if stripped_name and stripped_name != base_name:
+        name_variants.append(stripped_name)
+
+    # Try each variant until we find a man page
+    result = None
+    for name in name_variants:
+        result = _try_man_page(name)
+        if result:
+            break
+
+    if not result:
+        return None
+
+    # Parse the man page output to find NAME and DESCRIPTION
+    lines = result.stdout.split("\n")
+    description_lines = []
+    in_name = False
+    in_description = False
+    found_name = False
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Look for NAME section
+        if stripped == "NAME":
+            in_name = True
+            in_description = False
+            continue
+
+        # Look for SYNOPSIS or DESCRIPTION section (ends NAME)
+        if stripped in ["SYNOPSIS", "DESCRIPTION", "SYNTAX"]:
+            if stripped == "DESCRIPTION":
+                in_description = True
+            in_name = False
+            if found_name and stripped != "DESCRIPTION":
+                break
+            continue
+
+        # Other sections end DESCRIPTION
+        if in_description and stripped and stripped.isupper() and not stripped[0].isspace():
+            break
+
+        # Capture NAME content
+        if in_name and stripped:
+            description_lines.append(stripped)
+            found_name = True
+
+        # Capture first paragraph of DESCRIPTION (limit to ~3 lines)
+        if in_description and stripped:
+            description_lines.append(stripped)
+            if len(description_lines) > 5:
+                break
+
+    if description_lines:
+        # Join and truncate if too long
+        desc = " ".join(description_lines)
+        if len(desc) > 300:
+            desc = desc[:297] + "..."
+        return desc
+
+    return None
+
+
+# Cache for package registry lookups to avoid repeated network calls
+_package_registry_cache: Dict[str, Optional[Dict[str, str]]] = {}
+_desc_cache: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def load_desc_cache() -> Dict[str, Dict[str, str]]:
+    """
+    Load the cached descriptor lookup results from disk.
+    The cache is best-effort and may be skipped when malformed or missing.
+    """
+    global _desc_cache
+    if _desc_cache is not None:
+        return _desc_cache
+
+    if not DESC_CACHE_FILE.exists():
+        _desc_cache = {}
+        return _desc_cache
+
+    try:
+        data = json.loads(DESC_CACHE_FILE.read_text())
+        entries = data.get("entries", data) if isinstance(data, dict) else {}
+        if not isinstance(entries, dict):
+            entries = {}
+        _desc_cache = entries
+    except (OSError, json.JSONDecodeError, AttributeError):
+        _desc_cache = {}
+
+    return _desc_cache
+
+
+def save_desc_cache(cache: Optional[Dict[str, Dict[str, str]]] = None) -> None:
+    """Persist description cache to disk with restrictive permissions."""
+    cache = cache if cache is not None else load_desc_cache()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    temp_file = DESC_CACHE_FILE.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w") as f:
+            os.chmod(temp_file, 0o600)
+            json.dump({"entries": cache}, f)
+        temp_file.rename(DESC_CACHE_FILE)
+    except OSError:
+        if temp_file.exists():
+            temp_file.unlink()
+
+
+def get_desc_cache_entry(name: str) -> Optional[Dict[str, str]]:
+    """
+    Return cached description if present and still within the valid TTL window.
+    Expires positive entries after 30 days and negative entries after 6 hours.
+    """
+    if not name:
+        return None
+    cache = load_desc_cache()
+    entry = cache.get(name)
+    if not entry:
+        return None
+
+    try:
+        ts = float(entry.get("ts", 0))
+    except (TypeError, ValueError):
+        ts = 0
+    negative = bool(entry.get("negative"))
+    ttl = DESC_CACHE_NEGATIVE_TTL_SECONDS if negative else DESC_CACHE_TTL_SECONDS
+    if ts and (time.time() - ts) > ttl:
+        cache.pop(name, None)
+        save_desc_cache(cache)
+        return None
+
+    return {k: v for k, v in entry.items() if k not in ("ts", "negative")}
+
+
+def update_desc_cache(name: str, info: Dict[str, str]) -> None:
+    """
+    Store a descriptor result (including negative outcomes) with a timestamp.
+    Negative entries earn a shorter TTL so we retry sooner.
+    """
+    if not name or not info:
+        return
+    desc = info.get("description", "")
+    negative = desc in ["Unable to identify automatically", "No description available", ""]
+    cache = load_desc_cache()
+    entry = dict(info)
+    entry["ts"] = time.time()
+    if negative:
+        entry["negative"] = True
+    cache[name] = entry
+    save_desc_cache(cache)
+
+
+def query_npm_registry(package_name: str) -> Optional[Dict[str, str]]:
+    """
+    Query npm registry for package information.
+    Returns dict with 'name', 'description', 'url', 'downloads' or None.
+    Falls back to GitHub for description if npm has none.
+    """
+    if not package_name:
+        return None
+
+    # Check cache first
+    cache_key = f"npm:{package_name}"
+    if cache_key in _package_registry_cache:
+        return _package_registry_cache[cache_key]
+
+    try:
+        # npm registry API
+        url = f"https://registry.npmjs.org/{package_name}"
+        result = subprocess.run(
+            ["curl", "-s", "-m", "5", url],
+            capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode != 0 or not result.stdout:
+            _package_registry_cache[cache_key] = None
+            return None
+
+        import json
+        data = json.loads(result.stdout)
+
+        if "error" in data:
+            _package_registry_cache[cache_key] = None
+            return None
+
+        npm_desc = data.get("description") or ""
+
+        info = {
+            "source": "npm",
+            "name": data.get("name", package_name),
+            "description": npm_desc,
+            "url": f"https://www.npmjs.com/package/{package_name}",
+        }
+
+        # Try to get download counts from npm API
+        try:
+            dl_url = f"https://api.npmjs.org/downloads/point/last-week/{package_name}"
+            dl_result = subprocess.run(
+                ["curl", "-s", "-m", "3", dl_url],
+                capture_output=True, text=True, timeout=5
+            )
+            if dl_result.returncode == 0 and dl_result.stdout:
+                dl_data = json.loads(dl_result.stdout)
+                downloads = dl_data.get("downloads", 0)
+                info["downloads"] = f"{downloads:,}/week"
+        except:
+            pass
+
+        # If npm has no description, try to get one from GitHub
+        if not npm_desc or npm_desc in ["No description", ""]:
+            gh_info = query_github_search(package_name)
+            if gh_info and gh_info.get("description"):
+                info["description"] = gh_info["description"]
+                info["github_url"] = gh_info.get("url", "")
+                info["stars"] = gh_info.get("stars", "")
+
+        # Final fallback
+        if not info.get("description"):
+            info["description"] = "No description available"
+
+        _package_registry_cache[cache_key] = info
+        return info
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, json.JSONDecodeError):
+        _package_registry_cache[cache_key] = None
+        return None
+
+
+def query_pypi_registry(package_name: str) -> Optional[Dict[str, str]]:
+    """
+    Query PyPI registry for package information.
+    Returns dict with 'name', 'description', 'url' or None.
+    """
+    if not package_name:
+        return None
+
+    # Check cache first
+    cache_key = f"pypi:{package_name}"
+    if cache_key in _package_registry_cache:
+        return _package_registry_cache[cache_key]
+
+    try:
+        url = f"https://pypi.org/pypi/{package_name}/json"
+        result = subprocess.run(
+            ["curl", "-s", "-m", "5", url],
+            capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode != 0 or not result.stdout:
+            _package_registry_cache[cache_key] = None
+            return None
+
+        import json
+        data = json.loads(result.stdout)
+
+        if "info" not in data:
+            _package_registry_cache[cache_key] = None
+            return None
+
+        info_data = data["info"]
+        info = {
+            "source": "PyPI",
+            "name": info_data.get("name", package_name),
+            "description": (info_data.get("summary") or "No description")[:200],
+            "url": info_data.get("project_url") or f"https://pypi.org/project/{package_name}/",
+        }
+
+        _package_registry_cache[cache_key] = info
+        return info
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, json.JSONDecodeError):
+        _package_registry_cache[cache_key] = None
+        return None
+
+
+def query_github_search(name: str) -> Optional[Dict[str, str]]:
+    """
+    Query GitHub API to search for a repository matching the name.
+    Returns dict with 'name', 'description', 'url', 'stars' or None.
+    """
+    if not name:
+        return None
+
+    # Check cache first
+    cache_key = f"github:{name}"
+    if cache_key in _package_registry_cache:
+        return _package_registry_cache[cache_key]
+
+    try:
+        # GitHub search API (no auth needed for basic searches, but rate limited)
+        url = f"https://api.github.com/search/repositories?q={name}+in:name&per_page=1"
+        result = subprocess.run(
+            ["curl", "-s", "-m", "5", "-H", "Accept: application/vnd.github.v3+json", url],
+            capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode != 0 or not result.stdout:
+            _package_registry_cache[cache_key] = None
+            return None
+
+        import json
+        data = json.loads(result.stdout)
+
+        if not data.get("items"):
+            _package_registry_cache[cache_key] = None
+            return None
+
+        repo = data["items"][0]
+        info = {
+            "source": "GitHub",
+            "name": repo.get("full_name", name),
+            "description": (repo.get("description") or "No description")[:200],
+            "url": repo.get("html_url", ""),
+            "stars": f"{repo.get('stargazers_count', 0):,} stars",
+        }
+
+        _package_registry_cache[cache_key] = info
+        return info
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, json.JSONDecodeError):
+        _package_registry_cache[cache_key] = None
+        return None
+
+
+def detect_process_ecosystem(proc: "ProcessInfo") -> str:
+    """
+    Detect what ecosystem a process belongs to based on path and parent.
+    Returns: 'npm', 'pypi', 'cargo', 'go', or 'generic'
+    """
+    path = proc.path or ""
+    cmdline = proc.cmdline or ""
+    name = proc.name or ""
+
+    # Check for Node.js / npm
+    if any(x in path.lower() for x in ["node_modules", "/npm/", "nodejs"]):
+        return "npm"
+    if any(x in cmdline.lower() for x in ["node ", "npx ", "npm "]):
+        return "npm"
+
+    # Check for Python / PyPI
+    if any(x in path.lower() for x in ["site-packages", "dist-packages", "/pip/", "python"]):
+        return "pypi"
+    if any(x in cmdline.lower() for x in ["python", "pip "]):
+        return "pypi"
+
+    # Check for Rust / Cargo
+    if "/.cargo/" in path or "/cargo/" in path.lower():
+        return "cargo"
+
+    # Check for Go
+    if "/go/bin/" in path or "GOPATH" in path:
+        return "go"
+
+    return "generic"
+
+
+def extract_package_from_path(path: str) -> Optional[str]:
+    """
+    Extract the meaningful package/application name from a file path.
+    Uses subtractive approach: strip common prefixes and generic filenames.
+
+    Examples:
+        /usr/share/system-config-printer/applet.py -> system-config-printer
+        /usr/lib/firefox/firefox-bin -> firefox
+        /opt/google/chrome/chrome -> google/chrome or chrome
+        /home/user/.local/bin/foo -> None (user-local, not informative)
+    """
+    if not path:
+        return None
+
+    # Common non-informative prefixes to strip
+    strip_prefixes = [
+        "/usr/share/",
+        "/usr/lib/",
+        "/usr/lib64/",
+        "/usr/libexec/",
+        "/opt/",
+        "/snap/",
+        "/var/lib/snapd/snap/",
+        "/var/lib/flatpak/",
+        "/app/",  # flatpak
+    ]
+
+    # Generic filenames that don't tell us anything
+    generic_filenames = {
+        "applet.py", "main.py", "__main__.py", "run.py", "app.py", "start.py",
+        "applet.sh", "main.sh", "run.sh", "start.sh", "launch.sh",
+        "index.js", "main.js", "app.js", "server.js", "cli.js",
+        "main", "run", "start", "launch", "bin", "lib", "exec",
+    }
+
+    # Generic directory names to skip
+    generic_dirs = {
+        "bin", "lib", "lib64", "libexec", "share", "usr", "opt", "var",
+        "current", "common", "x86_64-linux-gnu", "python3", "python3.10",
+        "python3.11", "python3.12", "node_modules", "dist-packages", "site-packages",
+    }
+
+    remaining = path
+
+    # Strip known prefixes
+    for prefix in strip_prefixes:
+        if remaining.startswith(prefix):
+            remaining = remaining[len(prefix):]
+            break
+
+    # Skip if it's in user home directory (not system-installed)
+    if remaining.startswith("/home/") or remaining.startswith("~"):
+        return None
+
+    # Split into parts and filter out generic ones
+    parts = [p for p in remaining.split("/") if p]
+
+    # Remove generic filenames from the end
+    while parts and parts[-1].lower() in generic_filenames:
+        parts.pop()
+
+    # Remove file extension from last part
+    if parts:
+        last = parts[-1]
+        last = re.sub(r'\.(py|sh|pl|rb|js|ts|exe|bin)$', '', last, flags=re.IGNORECASE)
+        # If after stripping extension it becomes generic, remove it
+        if last.lower() in generic_filenames or last.lower() in generic_dirs:
+            parts.pop()
+        else:
+            parts[-1] = last
+
+    # Filter out generic directory names, keeping meaningful ones
+    meaningful = []
+    for part in parts:
+        if part.lower() not in generic_dirs:
+            meaningful.append(part)
+
+    if not meaningful:
+        return None
+
+    # Return the most specific meaningful part (usually the first one after prefix strip)
+    # For paths like /opt/google/chrome/chrome, return "google-chrome" or just first meaningful
+    if len(meaningful) >= 2:
+        # Check if last part is similar to a previous part (like chrome/chrome)
+        if meaningful[-1].lower() in meaningful[-2].lower():
+            return meaningful[-2]
+        # Return first meaningful part (usually the package name)
+        return meaningful[0]
+
+    return meaningful[0] if meaningful else None
+
+
+def get_process_description(proc: "ProcessInfo") -> Optional[Dict[str, str]]:
+    """
+    Get a description of a process from various sources.
+    Tries in order: package description, man page, GitHub, path extraction, fallback search link.
+
+    Returns dict with 'source', 'description', and optionally 'url', 'stars', etc.
+    """
+    name = proc.name
+    if not name:
+        return None
+
+    # 0. Check if we already have a description from the package manager (most authoritative)
+    if proc.provenance.description:
+        pkg_name = proc.provenance.package or name
+        return {
+            "source": f"package ({proc.provenance.manager})",
+            "name": pkg_name,
+            "description": proc.provenance.description,
+        }
+
+    # Clean up process name
+    clean_name = name.strip("()").split("/")[-1]
+    clean_name = re.sub(r'\.(py|sh|pl|rb)$', '', clean_name)
+    clean_name = re.sub(r'[0-9.]+$', '', clean_name)
+
+    if not clean_name or len(clean_name) < 2:
+        return None
+
+    cached = get_desc_cache_entry(clean_name)
+    if cached:
+        return cached
+
+    def cache_and_return(info: Dict[str, str]) -> Dict[str, str]:
+        update_desc_cache(clean_name, info)
+        return info
+
+    # 1. Try man page first (fast, local)
+    man_desc = get_man_page_description(name)
+    if man_desc:
+        return cache_and_return({
+            "source": "man page",
+            "name": clean_name,
+            "description": man_desc,
+        })
+
+
+    # 2. Try GitHub search (best source for descriptions)
+    # Try multiple search variations to find the best match
+    search_queries = [
+        f"{clean_name}-code",                # common naming for coding tools
+        f"{clean_name}-cli",                 # common CLI naming
+        f"{clean_name} cli tool",            # descriptive search
+        clean_name,                          # exact name (last because too generic)
+    ]
+
+    for query in search_queries:
+        result = query_github_search(query)
+        if result and result.get("description") and result["description"] != "No description":
+            # Verify the result is relevant (name should contain our search term)
+            result_name = result.get("name", "").lower()
+            if clean_name.lower() in result_name:
+                # Additional relevance check for generic names
+                # For short generic names, require higher star count or CLI-related description
+                desc_lower = result.get("description", "").lower()
+                if len(clean_name) <= 6:  # Short names like "applet" need stronger matching
+                    # Check if description mentions CLI/tool concepts
+                    cli_keywords = ["cli", "command", "terminal", "tool", "utility", "shell", "script"]
+                    has_cli_keyword = any(kw in desc_lower for kw in cli_keywords)
+                    # Or check if highly starred (popular = more likely correct)
+                    stars = int(result.get("stars", "0").replace(",", "").replace(" stars", "") or 0)
+                    if not has_cli_keyword and stars < 1000:
+                        continue  # Skip low-confidence matches for generic names
+                return cache_and_return(result)
+
+    # 3. Try to extract package name from path
+    # For paths like /usr/share/system-config-printer/applet.py, extract "system-config-printer"
+    path = proc.path or ""
+    cmdline = proc.cmdline or ""
+
+    # Try extracting from the executable path first
+    pkg_name = extract_package_from_path(path)
+
+    # If that didn't work, try extracting from cmdline (for interpreted scripts)
+    if not pkg_name and cmdline:
+        # For "python3 /usr/share/foo/bar.py", extract from the script path
+        parts = cmdline.split()
+        for part in parts:
+            if part.startswith("/") and not part.startswith("/usr/bin/") and not part.startswith("/bin/"):
+                pkg_name = extract_package_from_path(part)
+                if pkg_name:
+                    break
+
+    if pkg_name and pkg_name != clean_name:
+        # Try GitHub search with the extracted package name
+        result = query_github_search(pkg_name)
+        if result and result.get("description") and result["description"] != "No description":
+            return cache_and_return(result)
+
+        # Even if GitHub fails, the package name itself is informative
+        return cache_and_return({
+            "source": "path",
+            "name": pkg_name,
+            "description": f"Part of {pkg_name}",
+            "url": f"https://duckduckgo.com/?q={pkg_name}+linux",
+        })
+
+    # 4. Return a helpful fallback with search link
+    return cache_and_return({
+        "source": "web search",
+        "name": clean_name,
+        "description": "Unable to identify automatically",
+        "url": f"https://duckduckgo.com/?q={clean_name}+linux+process",
+    })
+
+
+def process_to_dict(proc: "ProcessInfo", raw_cmdline: bool = False) -> Dict:
+    """
+    Serialize a process for JSON/NDJSON output including scoring metadata.
+
+    The returned dict contains trust_level, weirdness_score, description,
+    provenance details, and connections so downstream consumers (btop, JSON
+    scripts) can build richer UX layers.
+    """
+    cmdline = proc.cmdline if raw_cmdline else sanitize_cmdline(proc.cmdline)
+    return {
+        "pid": proc.pid,
+        "name": proc.name,
+        "path": proc.path,
+        "cmdline": cmdline,
+        "uid": proc.uid,
+        "username": proc.username,
+        "ppid": proc.ppid,
+        "memory_mb": proc.memory_mb,
+        "trust_level": proc.trust_level.value,
+        "weirdness_score": proc.weirdness_score,
+        "package": proc.package,
+        "provenance": {
+            "manager": proc.provenance.manager,
+            "ownership": proc.provenance.ownership,
+            "signature": proc.provenance.signature,
+        },
+        "evidence": proc.evidence,
+        "connections": [
+            {
+                "local_address": c.local_address,
+                "local_port": c.local_port,
+                "remote_address": c.remote_address,
+                "remote_port": c.remote_port,
+                "state": c.state,
+                "protocol": c.protocol,
+                "hostname": c.hostname,
+            }
+            for c in proc.connections
+        ],
+        "process_key": proc.process_key,
+        "is_deleted": proc.is_deleted,
+        "is_memfd": proc.is_memfd,
+        "description": proc.cached_description,
+    }
+
+
+def load_rules() -> Dict:
+    """Load rules from rules.toml (best-effort)."""
+    rules = {"profiles": {}, "allow": [], "rules": []}
+    if tomllib and RULES_FILE.exists():
+        try:
+            data = tomllib.loads(RULES_FILE.read_text())
+            rules["profiles"] = data.get("profiles", {}) or {}
+            rules["allow"] = data.get("allow", []) or []
+            rules["rules"] = data.get("rules", []) or []
+        except (OSError, ValueError, TypeError):
+            pass
+    return rules
+
+
+def match_rule(proc: "ProcessInfo", rule: Dict) -> bool:
+    """Match a rule against a process."""
+    def match_field(value: str, cond: Dict) -> bool:
+        if "equals" in cond and value != cond["equals"]:
+            return False
+        if "contains" in cond and cond["contains"] not in value:
+            return False
+        if "regex" in cond:
+            try:
+                if not re.search(cond["regex"], value):
+                    return False
+            except re.error:
+                return False
+        return True
+
+    checks = []
+    if "name" in rule:
+        checks.append(match_field(proc.name, rule["name"]))
+    if "path" in rule:
+        checks.append(match_field(proc.path or "", rule["path"]))
+    if "cmdline" in rule:
+        checks.append(match_field(proc.cmdline or "", rule["cmdline"]))
+    if "uid" in rule:
+        checks.append(str(proc.uid) == str(rule["uid"]))
+    if "manager" in rule:
+        checks.append(proc.provenance.manager == rule["manager"])
+    if "package" in rule:
+        checks.append(proc.provenance.package == rule["package"])
+    if "trust_level" in rule:
+        checks.append(proc.trust_level.value == rule["trust_level"])
+
+    return all(checks) if checks else False
+
+
+def apply_rules(processes: List["ProcessInfo"]) -> None:
+    """Apply rules to processes (suppress/downgrade/upgrade/tag)."""
+    ruleset = load_rules()
+    policy = load_policy()
+    profile = policy.get("profile", "default")
+
+    profile_rules = ruleset.get("profiles", {}).get(profile, {})
+    allow_rules = ruleset.get("allow", []) + profile_rules.get("allow", [])
+    rules = ruleset.get("rules", []) + profile_rules.get("rules", [])
+
+    for proc in processes:
+        for allow in allow_rules:
+            if match_rule(proc, allow):
+                proc.trust_level = TrustLevel.USER_TRUSTED
+                proc.evidence.append("Rule: allow")
+                proc.weirdness_score = 0
+                break
+
+        for rule in rules:
+            if not match_rule(proc, rule):
+                continue
+            action = rule.get("action", "")
+            if action == "suppress":
+                proc.weirdness_score = 0
+                proc.evidence.append("Rule: suppressed")
+            elif action == "downgrade":
+                proc.weirdness_score = max(0, int(proc.weirdness_score * 0.5))
+                proc.evidence.append("Rule: downgraded")
+            elif action == "upgrade":
+                proc.weirdness_score += int(rule.get("add", 10))
+                proc.evidence.append("Rule: upgraded")
+            elif action == "tag":
+                proc.evidence.append(f"Rule tag: {rule.get('tag', 'custom')}")
+
+
+def build_alerts(processes: List["ProcessInfo"]) -> Tuple[List[Dict], int]:
+    """Build alerts list and exit code."""
+    policy = load_policy()
+    warn = policy["thresholds"]["warn"]
+    critical = policy["thresholds"]["critical"]
+    alerts = []
+    exit_code = 0
+
+    for proc in processes:
+        is_critical = proc.is_deleted or proc.is_memfd or proc.weirdness_score >= critical
+        is_warning = proc.weirdness_score >= warn
+
+        if is_critical:
+            alerts.append({
+                "severity": "critical",
+                "pid": proc.pid,
+                "process_key": proc.process_key,
+                "reason": "memfd/deleted or score >= critical",
+            })
+            exit_code = max(exit_code, 2)
+        elif is_warning:
+            alerts.append({
+                "severity": "warning",
+                "pid": proc.pid,
+                "process_key": proc.process_key,
+                "reason": "score >= warn",
+            })
+            exit_code = max(exit_code, 1)
+
+    return alerts, exit_code
+
+
+def get_username(uid: int) -> str:
+    """Get username from UID."""
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+class TrustLevel(Enum):
+    """Trust levels for process classification."""
+    OFFICIAL_REPO = "OFFICIAL"
+    THIRD_PARTY_REPO = "THIRD_PARTY"
+    UNTRACKED_KEY = "UNTRACKED_KEY_MATERIAL"
+    FLATPAK = "FLATPAK"
+    SNAP = "SNAP"
+    APPIMAGE = "APPIMAGE"
+    USER_LOCAL = "USER_LOCAL"
+    CONTAINER = "CONTAINER"
+    USER_TRUSTED = "USER_TRUSTED"
+    KERNEL = "KERNEL"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class ProvenanceInfo:
+    """Two-axis provenance information."""
+    ownership: str = "unknown"          # "owned" | "unowned" | "unknown"
+    signature: str = "unknown"          # "official" | "third_party" | "unverified" | "unknown"
+    manager: str = ""
+    package: str = ""
+    description: str = ""               # Package description (from package manager)
+    evidence: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ProcessInfo:
+    """Information about a running process."""
+    pid: int
+    name: str
+    path: str
+    cmdline: str
+    uid: int
+    username: str = ""
+    ppid: int = 0
+    memory_mb: float = 0.0
+    trust_level: TrustLevel = TrustLevel.UNKNOWN
+    provenance: ProvenanceInfo = field(default_factory=ProvenanceInfo)
+    evidence: List[str] = field(default_factory=list)
+    weirdness_score: int = 0
+    package: str = ""
+    connections: List["NetworkConnection"] = field(default_factory=list)
+    process_key: str = ""
+    is_container: bool = False
+    container_evidence: List[str] = field(default_factory=list)
+    # New security-relevant fields
+    is_deleted: bool = False
+    is_memfd: bool = False
+    memfd_evidence: List[str] = field(default_factory=list)
+    # Cached description from man page or package registry
+    cached_description: str = ""
+
+
+@dataclass
+class NetworkConnection:
+    """Network connection information."""
+    local_address: str
+    local_port: int
+    remote_address: str
+    remote_port: int
+    state: str
+    protocol: str
+    hostname: str = ""
+
+
+# =============================================================================
+# File -> Package Cache
+# =============================================================================
+
+class FilePackageCache:
+    """Cache mapping files to their owning packages with integrity verification."""
+
+    def __init__(self):
+        self._cache: Dict[str, str] = {}
+        self._diversions: Dict[str, str] = {}
+        self._alternatives: Dict[str, str] = {}
+        self._dpkg_status_mtime: float = 0
+
+    @staticmethod
+    def _compute_cache_checksum(cache_data: Dict[str, str], mtime: float) -> str:
+        """Compute SHA256 checksum of cache contents for integrity verification."""
+        # Create a deterministic string representation
+        sorted_items = sorted(cache_data.items())
+        content = f"{mtime}:" + "|".join(f"{k}={v}" for k, v in sorted_items)
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    @staticmethod
+    def _verify_cache_permissions(cache_path: Path) -> bool:
+        """Verify cache file has safe permissions (not world-writable)."""
+        try:
+            stat_info = cache_path.stat()
+            # Check if world-writable (o+w)
+            if stat_info.st_mode & 0o002:
+                debug_log("cache_permissions", f"Cache file is world-writable: {cache_path}")
+                return False
+            # Check if owned by current user
+            if stat_info.st_uid != os.getuid():
+                debug_log("cache_permissions", f"Cache file not owned by current user: {cache_path}")
+                return False
+            return True
+        except OSError:
+            return False
+
+    def build(self, force: bool = False) -> None:
+        """Build the file->package cache from dpkg list files."""
+        debug_log("cache_build", f"start force={force}")
+        dpkg_status = Path("/var/lib/dpkg/status")
+        current_mtime = dpkg_status.stat().st_mtime if dpkg_status.exists() else 0
+
+        # Check if rebuild needed
+        if not force and CACHE_FILE.exists():
+            # Security: Verify cache file permissions before trusting it
+            if not self._verify_cache_permissions(CACHE_FILE):
+                debug_log("cache_security", "Cache file failed permission check, rebuilding")
+                force = True
+            else:
+                try:
+                    with open(CACHE_FILE) as f:
+                        data = json.load(f)
+                        stored_checksum = data.get("checksum", "")
+                        cache_data = data.get("cache", {})
+                        stored_mtime = data.get("mtime", 0)
+
+                        # Verify integrity checksum
+                        if stored_checksum:
+                            computed_checksum = self._compute_cache_checksum(cache_data, stored_mtime)
+                            if computed_checksum != stored_checksum:
+                                debug_log("cache_integrity", "Cache checksum mismatch, rebuilding")
+                                force = True
+
+                        if not force and stored_mtime == current_mtime and cache_data:
+                            self._cache = cache_data
+                            self._dpkg_status_mtime = current_mtime
+                            return
+                except (json.JSONDecodeError, KeyError, OSError) as e:
+                    debug_log("cache_load_error", f"Failed to load cache: {e}")
+                    pass
+
+        # Build cache from .list files
+        self._cache = {}
+        list_dir = Path("/var/lib/dpkg/info")
+
+        if list_dir.exists():
+            debug_log("cache_build", f"reading list files in {list_dir}")
+            for list_file in list_dir.glob("*.list"):
+                # Package name is the filename without .list and arch suffix
+                package = list_file.stem
+                # Remove architecture suffix like :amd64
+                if ":" in package:
+                    package = package.split(":")[0]
+
+                try:
+                    with open(list_file) as f:
+                        for line in f:
+                            filepath = line.strip()
+                            if filepath and filepath.startswith("/"):
+                                self._cache[filepath] = package
+                                # Also store realpath-resolved version for symlink handling
+                                # (e.g., /bin -> /usr/bin on merged-usr systems)
+                                # Use safe_realpath to validate symlink doesn't escape
+                                resolved = safe_realpath(filepath)
+                                if resolved and resolved != filepath:
+                                    self._cache[resolved] = package
+                except (IOError, PermissionError) as e:
+                    debug_log("cache_build_error", f"Failed to read {list_file}: {e}")
+                    continue
+
+        # Load diversions
+        self._load_diversions()
+
+        # Save cache with integrity checksum
+        self._dpkg_status_mtime = current_mtime
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        checksum = self._compute_cache_checksum(self._cache, self._dpkg_status_mtime)
+
+        # Write cache file with restrictive permissions
+        cache_data = {
+            "mtime": self._dpkg_status_mtime,
+            "cache": self._cache,
+            "checksum": checksum
+        }
+
+        # Use atomic write with secure permissions
+        temp_file = CACHE_FILE.with_suffix('.tmp')
+        try:
+            with open(temp_file, "w") as f:
+                os.chmod(temp_file, 0o600)  # Owner read/write only
+                json.dump(cache_data, f)
+            temp_file.rename(CACHE_FILE)
+            debug_log("cache_build", f"done entries={len(self._cache)}")
+        except OSError as e:
+            debug_log("cache_write_error", f"Failed to write cache: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
+
+    def _load_diversions(self) -> None:
+        """Load dpkg diversions."""
+        try:
+            result = subprocess.run(
+                ["dpkg-divert", "--list"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return
+
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # Format: "diversion of <orig> to <diverted> by <package>"
+                # or:      "local diversion of <orig> to <diverted>"
+                if " diversion of " in line and " to " in line:
+                    try:
+                        _, rest = line.split(" diversion of ", 1)
+                        orig, tail = rest.split(" to ", 1)
+                        pkg = "LOCAL"
+                        if " by " in tail:
+                            _, pkg = tail.rsplit(" by ", 1)
+                        if orig:
+                            self._diversions[orig.strip()] = pkg.strip()
+                    except ValueError:
+                        continue
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return
+
+    def get(self, path: str) -> Optional[str]:
+        """Get the package that owns a file path."""
+        # Resolve symlinks first (for lookups, we don't need strict validation)
+        try:
+            resolved = os.path.realpath(path)
+        except (OSError, ValueError) as e:
+            debug_log("cache_lookup", f"Failed to resolve {path}: {e}")
+            resolved = path
+
+        # Check main cache
+        if resolved in self._cache:
+            return self._cache[resolved]
+
+        # Check diversions
+        if resolved in self._diversions:
+            return self._diversions[resolved]
+
+        # Check original path if different from resolved
+        if path != resolved and path in self._cache:
+            return self._cache[path]
+
+        return None
+
+
+# Global cache instance
+file_package_cache = FilePackageCache()
+_repo_url_cache: Dict[str, Optional[str]] = {}
+_inrelease_cache: Dict[str, Optional[Path]] = {}
+_signer_cache: Dict[str, Optional[str]] = {}
+_official_fps_cache: Optional[Set[str]] = None
+_owner_cache: Dict[Tuple[str, str], Optional[str]] = {}
+_pkg_info_cache: Dict[Tuple[str, str], Dict[str, str]] = {}
+_network_probe_enabled: bool = False
+
+
+def run_command(cmd: List[str], timeout: int = 10) -> Optional[str]:
+    """Run a command and return stdout on success."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def run_command_ok(cmd: List[str], timeout: int = 10) -> Optional[bool]:
+    """Run a command and return True/False on completion, None if unavailable."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+# =============================================================================
+# Policy (config-driven scoring & toggles)
+# =============================================================================
+
+_policy_cache: Optional[Dict] = None
+_collector_errors: List[str] = []
+
+
+def load_policy() -> Dict:
+    """Load scoring policy from config.toml (best-effort)."""
+    global _policy_cache
+    if _policy_cache is not None:
+        return _policy_cache
+
+    policy = {
+        "scores": {
+            "deleted_exe": 50,
+            "memfd_exec": 60,
+            "elf_suspicious": 25,
+            "random_name": 20,
+            "suspicious_path": 30,
+            "bare_interpreter": 10,
+            "high_memory_unknown": 15,
+            "many_connections": 10,
+            "raw_ip_per": 5,
+            "raw_ip_max": 15,
+            "official_suspicious_parent": 15,
+            "unusual_port": 5,
+            "network_exposed_service": 20,
+        },
+        "toggles": {
+            "official_suspicious_parent": False,
+            "official_network_scoring": False,
+            "network_exposed_service": False,
+            "unusual_port": False,
+        },
+        "signals": {
+            "suspicious_paths_prefix": ["/tmp/", "/dev/shm/", "/var/tmp/"],
+            "suspicious_paths_contains": ["/.cache/"],
+        },
+        "thresholds": {
+            "warn": 20,
+            "critical": 50,
+        },
+        "net": {
+            "allow_private": True,
+            "allow_loopback": True,
+            "allow_link_local": True,
+            "allow_cdn": False,
+            "allowed_networks": [],
+            "common_ports": [80, 443, 53, 123, 22, 25, 587, 465, 110, 995, 143, 993, 389, 636, 3306, 5432, 6379, 27017, 9200, 8080, 8443],
+        },
+        "profile": "default",
+    }
+
+    if tomllib and CONFIG_FILE.exists():
+        try:
+            data = tomllib.loads(CONFIG_FILE.read_text())
+            cfg = data.get("policy", {})
+            scores = cfg.get("scores", {})
+            toggles = cfg.get("toggles", {})
+            signals = cfg.get("signals", {})
+            thresholds = cfg.get("thresholds", {})
+            netcfg = cfg.get("net", {})
+            profile = cfg.get("profile")
+            policy["scores"].update({k: int(v) for k, v in scores.items()})
+            policy["toggles"].update({k: bool(v) for k, v in toggles.items()})
+            if isinstance(signals.get("suspicious_paths_prefix"), list):
+                policy["signals"]["suspicious_paths_prefix"] = [str(p) for p in signals.get("suspicious_paths_prefix")]
+            if isinstance(signals.get("suspicious_paths_contains"), list):
+                policy["signals"]["suspicious_paths_contains"] = [str(p) for p in signals.get("suspicious_paths_contains")]
+            if "warn" in thresholds:
+                policy["thresholds"]["warn"] = int(thresholds["warn"])
+            if "critical" in thresholds:
+                policy["thresholds"]["critical"] = int(thresholds["critical"])
+            if isinstance(netcfg.get("allowed_networks"), list):
+                policy["net"]["allowed_networks"] = [str(n) for n in netcfg.get("allowed_networks")]
+            for key in ["allow_private", "allow_loopback", "allow_link_local", "allow_cdn"]:
+                if key in netcfg:
+                    policy["net"][key] = bool(netcfg[key])
+            if isinstance(netcfg.get("common_ports"), list):
+                policy["net"]["common_ports"] = [int(p) for p in netcfg.get("common_ports")]
+            if isinstance(profile, str):
+                policy["profile"] = profile
+        except (OSError, ValueError, TypeError):
+            pass
+
+    _policy_cache = policy
+    return policy
+
+
+def report_collector_error(msg: str) -> None:
+    """Record a collector error for exit code/reporting."""
+    _collector_errors.append(msg)
+
+
+def find_cached_rpm_path(package: str) -> Optional[str]:
+    """Find a cached RPM file for a package in common cache locations."""
+    name_out = run_command(["rpm", "-q", "--qf", "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm", package])
+    if not name_out:
+        return None
+    filename = name_out.strip()
+    patterns = [
+        f"/var/cache/dnf/**/{filename}",
+        f"/var/cache/yum/**/{filename}",
+        f"/var/cache/zypp/packages/**/{filename}",
+    ]
+    for pattern in patterns:
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            return matches[0]
+    return None
+
+
+def get_pacman_siglevel() -> Optional[str]:
+    """Best-effort read of pacman SigLevel policy from /etc/pacman.conf."""
+    pacman_conf = Path("/etc/pacman.conf")
+    if not pacman_conf.exists():
+        return None
+    try:
+        for line in pacman_conf.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("siglevel"):
+                return stripped.split("=", 1)[1].strip()
+    except (IOError, PermissionError):
+        return None
+    return None
+
+
+def get_cached_info(manager: str, key: str, fetcher) -> Dict[str, str]:
+    """Cache and return package info for a manager."""
+    cache_key = (manager, key)
+    if cache_key in _pkg_info_cache:
+        return _pkg_info_cache[cache_key]
+    info = fetcher()
+    _pkg_info_cache[cache_key] = info
+    return info
+
+
+def get_cached_owner(manager: str, path: str, resolver) -> Optional[str]:
+    """Cache and return package owner for a path."""
+    cache_key = (manager, path)
+    if cache_key in _owner_cache:
+        return _owner_cache[cache_key]
+    owner = resolver()
+    _owner_cache[cache_key] = owner
+    return owner
+
+
+# =============================================================================
+# APT Provenance Verification
+# =============================================================================
+
+def get_repo_url(package: str) -> Optional[str]:
+    """Get the repository URL for a package from apt-cache policy."""
+    try:
+        result = subprocess.run(
+            ["apt-cache", "policy", package],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return None
+
+        lines = [ln.rstrip() for ln in result.stdout.splitlines()]
+        installed_idx = None
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("***"):
+                installed_idx = i
+                break
+
+        if installed_idx is not None:
+            for line in lines[installed_idx + 1:]:
+                if not line.startswith(" "):
+                    break
+                stripped = line.strip()
+                if stripped.startswith(("500 ", "100 ")):
+                    parts = stripped.split()
+                    if len(parts) >= 2:
+                        return parts[1]
+
+        # Fallback: first repo line
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(("500 ", "100 ")):
+                parts = stripped.split()
+                if len(parts) >= 2:
+                    return parts[1]
+
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def find_inrelease_for_repo(repo_url: str) -> Optional[Path]:
+    """Find the InRelease file for a repository URL."""
+    if not repo_url:
+        return None
+
+    apt_lists = Path("/var/lib/apt/lists")
+    if not apt_lists.exists():
+        return None
+
+    # Convert URL to filename format
+    # e.g., http://archive.ubuntu.com/ubuntu -> archive.ubuntu.com_ubuntu
+    url_part = repo_url.replace("http://", "").replace("https://", "")
+    url_part = url_part.replace("/", "_")
+
+    # Look for matching InRelease file
+    matches = []
+    for inrelease in apt_lists.glob("*_InRelease"):
+        if url_part in inrelease.name:
+            matches.append(inrelease)
+
+    if matches:
+        return max(matches, key=lambda p: len(p.name))
+
+    return None
+
+
+def get_apt_trusted_keyrings() -> List[str]:
+    """Get list of APT trusted keyring files."""
+    keyrings = []
+
+    # Legacy trusted.gpg
+    if os.path.exists("/etc/apt/trusted.gpg"):
+        keyrings.append("/etc/apt/trusted.gpg")
+
+    # trusted.gpg.d directory
+    trusted_d = Path("/etc/apt/trusted.gpg.d")
+    if trusted_d.exists():
+        keyrings.extend(str(p) for p in trusted_d.glob("*.gpg"))
+        keyrings.extend(str(p) for p in trusted_d.glob("*.asc"))
+
+    # Keyrings directory
+    keyrings_d = Path("/usr/share/keyrings")
+    if keyrings_d.exists():
+        keyrings.extend(str(p) for p in keyrings_d.glob("*.gpg"))
+
+    return keyrings
+
+
+def extract_gpg_fingerprint_with_keyrings(inrelease_path: Path, keyrings: List[str]) -> Optional[str]:
+    """
+    Verify an InRelease using gpgv against specific keyrings and return VALIDSIG fingerprint.
+    Uses gpgv instead of gpg to avoid using user's personal keyring.
+    """
+    for kr in keyrings:
+        if not kr or not os.path.exists(kr):
+            continue
+        try:
+            result = subprocess.run(
+                ["gpgv", "--status-fd=1", "--keyring", kr, str(inrelease_path)],
+                capture_output=True, text=True, timeout=10
+            )
+            out = result.stdout + "\n" + result.stderr
+            for line in out.splitlines():
+                if "VALIDSIG" in line:
+                    parts = line.split()
+                    for i, part in enumerate(parts):
+                        if part == "VALIDSIG" and i + 1 < len(parts):
+                            return parts[i + 1]
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+    return None
+
+
+def extract_gpg_fingerprint(inrelease_path: Path) -> Optional[str]:
+    """Extract GPG fingerprint from an InRelease file using APT's trusted keyrings."""
+    # Build list of keyrings to check (APT trusted keyrings, not user's keyring)
+    keyrings = OFFICIAL_KEYRINGS + get_apt_trusted_keyrings()
+
+    return extract_gpg_fingerprint_with_keyrings(inrelease_path, keyrings)
+
+
+def extract_keyring_fingerprints(keyring_paths: List[str]) -> Set[str]:
+    """Extract all fingerprints from keyring files."""
+    fingerprints = set()
+
+    for path in keyring_paths:
+        if not os.path.exists(path):
+            continue
+
+        try:
+            result = subprocess.run(
+                ["gpg", "--no-default-keyring", "--keyring", path,
+                 "--list-keys", "--with-fingerprint", "--with-colons"],
+                capture_output=True, text=True, timeout=10
+            )
+
+            for line in result.stdout.split("\n"):
+                if line.startswith("fpr:"):
+                    parts = line.split(":")
+                    if len(parts) >= 10:
+                        fingerprints.add(parts[9])
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+
+    return fingerprints
+
+
+def is_ip_literal(addr: str) -> bool:
+    """Return True if addr is a valid IPv4 or IPv6 literal."""
+    try:
+        ipaddress.ip_address(addr)
+        return True
+    except ValueError:
+        return False
+
+
+def get_sources_signed_by(repo_url: str) -> Optional[str]:
+    """Get the Signed-By key path from sources files."""
+
+    def check_list_file(filepath: Path) -> Optional[str]:
+        """Check a .list format sources file for Signed-By."""
+        try:
+            with open(filepath) as f:
+                for line in f:
+                    if repo_url in line and "signed-by=" in line.lower():
+                        match = re.search(r'signed-by=([^\s\]]+)', line, re.IGNORECASE)
+                        if match:
+                            return match.group(1)
+        except (IOError, PermissionError):
+            pass
+        return None
+
+    def check_sources_file(filepath: Path) -> Optional[str]:
+        """Check a .sources (DEB822) format file for Signed-By."""
+        try:
+            with open(filepath) as f:
+                content = f.read()
+                if repo_url in content:
+                    for line in content.split("\n"):
+                        if line.lower().startswith("signed-by:"):
+                            return line.split(":", 1)[1].strip()
+        except (IOError, PermissionError):
+            pass
+        return None
+
+    # Check /etc/apt/sources.list (the main file)
+    sources_list = Path("/etc/apt/sources.list")
+    if sources_list.exists() and sources_list.is_file():
+        result = check_list_file(sources_list)
+        if result:
+            return result
+
+    # Check /etc/apt/sources.list.d/ directory
+    sources_d = Path("/etc/apt/sources.list.d")
+    if sources_d.exists() and sources_d.is_dir():
+        # Check .sources files (DEB822 format)
+        for sources_file in sources_d.glob("*.sources"):
+            result = check_sources_file(sources_file)
+            if result:
+                return result
+
+        # Check .list files
+        for list_file in sources_d.glob("*.list"):
+            result = check_list_file(list_file)
+            if result:
+                return result
+
+    return None
+
+
+def verify_apt_provenance(binary_path: str) -> Tuple[ProvenanceInfo, TrustLevel]:
+    """Verify APT provenance for a binary."""
+    evidence = []
+    info = ProvenanceInfo(ownership="unknown", signature="unknown", manager="apt", package="")
+
+    # 1. Get package from binary
+    resolved_path = os.path.realpath(binary_path)
+    package = file_package_cache.get(resolved_path)
+    if not package:
+        info.ownership = "unowned"
+        return info, TrustLevel.UNKNOWN
+
+    evidence.append(f"Package: {package}")
+    info.ownership = "owned"
+    info.package = package
+
+    # Get package description from dpkg
+    desc_out = run_command(["dpkg-query", "-W", "-f", "${Description}", package])
+    if desc_out:
+        # Take just the first line (synopsis)
+        first_line = desc_out.strip().split('\n')[0]
+        if first_line:
+            info.description = first_line
+
+    # 2. Get repo URL
+    if package not in _repo_url_cache:
+        _repo_url_cache[package] = get_repo_url(package)
+    repo_url = _repo_url_cache[package]
+    if not repo_url:
+        evidence.append("Could not determine repository")
+        info.signature = "unknown"
+        info.evidence = evidence
+        return info, TrustLevel.UNKNOWN
+
+    evidence.append(f"Repository: {repo_url}")
+
+    # 3. Parse InRelease file
+    if repo_url not in _inrelease_cache:
+        _inrelease_cache[repo_url] = find_inrelease_for_repo(repo_url)
+    inrelease_path = _inrelease_cache[repo_url]
+    if inrelease_path:
+        inrel_key = str(inrelease_path)
+        if inrel_key not in _signer_cache:
+            _signer_cache[inrel_key] = extract_gpg_fingerprint(inrelease_path)
+        signer_fingerprint = _signer_cache[inrel_key]
+
+        if signer_fingerprint:
+            evidence.append(f"Signed by: {signer_fingerprint[:16]}...")
+
+            # 4. Check if fingerprint is in official keyrings
+            global _official_fps_cache
+            if _official_fps_cache is None:
+                _official_fps_cache = extract_keyring_fingerprints(OFFICIAL_KEYRINGS)
+            official_fps = _official_fps_cache
+
+            if signer_fingerprint in official_fps:
+                evidence.append("Fingerprint matches official keyring")
+                info.signature = "official"
+                info.evidence = evidence
+                return info, TrustLevel.OFFICIAL_REPO
+
+    # 5. Check Signed-By from sources
+    signed_by = get_sources_signed_by(repo_url)
+    if signed_by:
+        key_owner = file_package_cache.get(signed_by)
+        if key_owner:
+            evidence.append(f"Key owner: {key_owner}")
+
+            if "keyring" in key_owner.lower() and any(
+                distro in key_owner.lower()
+                for distro in ["ubuntu", "pop", "debian"]
+            ):
+                info.signature = "official"
+                info.evidence = evidence
+                return info, TrustLevel.OFFICIAL_REPO
+            else:
+                info.signature = "third_party"
+                info.evidence = evidence
+                return info, TrustLevel.THIRD_PARTY_REPO
+        else:
+            evidence.append(f"Key path: {signed_by} (owner unknown)")
+            info.signature = "unknown"
+            info.evidence = evidence
+            return info, TrustLevel.UNTRACKED_KEY
+
+    # 6. Fallback: assume third-party if from apt but can't verify chain
+    if repo_url:
+        evidence.append("Repository found but signing key not verified")
+        info.signature = "unverified"
+        info.evidence = evidence
+        return info, TrustLevel.THIRD_PARTY_REPO
+
+    info.signature = "unknown"
+    info.evidence = evidence
+    return info, TrustLevel.UNKNOWN
+
+
+# =============================================================================
+# Other Package Manager Provenance (best-effort)
+# =============================================================================
+
+def verify_rpm_provenance(binary_path: str) -> Optional[ProvenanceInfo]:
+    """Best-effort RPM provenance (DNF/YUM/Zypper)."""
+    if not shutil.which("rpm"):
+        return None
+
+    def resolve_owner() -> Optional[str]:
+        out = run_command(["rpm", "-qf", "--qf", "%{NAME}", binary_path])
+        return out.strip() if out else None
+
+    package = get_cached_owner("rpm", binary_path, resolve_owner)
+    if not package:
+        return None
+
+    evidence = [f"Package: {package}", "Package manager: rpm"]
+    info = ProvenanceInfo(ownership="owned", signature="unknown", manager="rpm", package=package)
+    env_hints = []
+    if shutil.which("dnf"):
+        env_hints.append("dnf")
+    if shutil.which("yum"):
+        env_hints.append("yum")
+    if shutil.which("zypper"):
+        env_hints.append("zypper")
+    if env_hints:
+        evidence.append(f"Environment: {', '.join(env_hints)}")
+
+    def fetch_info() -> Dict[str, str]:
+        rpm_info = {}
+        out = run_command(["rpm", "-qi", package])
+        if not out:
+            return rpm_info
+        for line in out.splitlines():
+            if line.startswith("From repo"):
+                rpm_info["repo"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Signature"):
+                rpm_info["signature"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Summary"):
+                rpm_info["description"] = line.split(":", 1)[1].strip()
+        return rpm_info
+
+    rpm_info = get_cached_info("rpm", package, fetch_info)
+    repo = rpm_info.get("repo")
+    signature = rpm_info.get("signature")
+    if repo:
+        evidence.append(f"Repository: {repo}")
+    if signature:
+        evidence.append(f"Signature: {signature}")
+
+    # Store package description in provenance
+    desc = rpm_info.get("description")
+    if desc:
+        info.description = desc
+
+    rpm_file = find_cached_rpm_path(package)
+    if rpm_file:
+        verifier = None
+        if shutil.which("rpmkeys"):
+            verifier = ["rpmkeys", "--checksig", rpm_file]
+        else:
+            verifier = ["rpm", "--checksig", rpm_file]
+        ok = run_command_ok(verifier, timeout=20)
+        if ok is True:
+            evidence.append("Signature verified (cached rpm)")
+            info.signature = "third_party"
+            info.evidence = evidence
+            return info
+        if ok is False:
+            evidence.append("Signature verification failed (cached rpm)")
+            info.signature = "unknown"
+            info.evidence = evidence
+            return info
+
+    evidence.append("Signature verification unavailable (need cached rpm file)")
+    info.signature = "unknown"
+    info.evidence = evidence
+    return info
+
+
+def verify_pacman_provenance(binary_path: str) -> Optional[ProvenanceInfo]:
+    """Best-effort Pacman provenance (Arch/Manjaro/etc.)."""
+    if not shutil.which("pacman"):
+        return None
+
+    def resolve_owner() -> Optional[str]:
+        out = run_command(["pacman", "-Qo", binary_path])
+        if not out:
+            return None
+        match = re.search(r" owned by (\S+)", out)
+        return match.group(1) if match else None
+
+    package = get_cached_owner("pacman", binary_path, resolve_owner)
+    if not package:
+        return None
+
+    evidence = [f"Package: {package}", "Package manager: pacman"]
+    info = ProvenanceInfo(ownership="owned", signature="unknown", manager="pacman", package=package)
+
+    def fetch_info() -> Dict[str, str]:
+        pacman_info = {}
+        # First try -Qi for local info (description)
+        out = run_command(["pacman", "-Qi", package])
+        if out:
+            for line in out.splitlines():
+                if line.startswith("Description"):
+                    pacman_info["description"] = line.split(":", 1)[1].strip()
+                    break
+        # Use -Si (sync database) for repo info - more reliable than -Qi
+        out = run_command(["pacman", "-Si", package])
+        if out:
+            for line in out.splitlines():
+                if line.startswith("Repository"):
+                    pacman_info["repo"] = line.split(":", 1)[1].strip()
+                    break
+        return pacman_info
+
+    pacman_info = get_cached_info("pacman", package, fetch_info)
+    repo = pacman_info.get("repo")
+    if repo:
+        evidence.append(f"Repository: {repo}")
+
+    # Store package description in provenance
+    desc = pacman_info.get("description")
+    if desc:
+        info.description = desc
+
+    siglevel = get_pacman_siglevel()
+    if siglevel:
+        evidence.append(f"SigLevel policy: {siglevel}")
+
+    # Determine trust level based on repository
+    # Official Arch repos have signed databases, so packages from them are trustworthy
+    if repo and repo in PACMAN_OFFICIAL_REPOS:
+        info.signature = "official"
+        evidence.append(f"Official Arch repository '{repo}' (signed package database)")
+    elif repo:
+        # Known repo but not official - could be chaotic-aur, endeavouros, etc.
+        info.signature = "third_party"
+        evidence.append(f"Third-party repository '{repo}'")
+    else:
+        # No repo info = AUR/local package build
+        info.signature = "unknown"
+        evidence.append("Local/AUR package (no repository signature)")
+
+    info.evidence = evidence
+    return info
+
+
+def verify_apk_provenance(binary_path: str) -> Optional[ProvenanceInfo]:
+    """Best-effort APK provenance (Alpine)."""
+    if not shutil.which("apk"):
+        return None
+
+    def resolve_owner() -> Optional[str]:
+        out = run_command(["apk", "info", "--who-owns", binary_path])
+        if not out:
+            return None
+        match = re.search(r"owned by (\S+)", out)
+        return match.group(1) if match else None
+
+    package = get_cached_owner("apk", binary_path, resolve_owner)
+    if not package:
+        return None
+
+    evidence = [f"Package: {package}", "Package manager: apk"]
+    info = ProvenanceInfo(ownership="owned", signature="unknown", manager="apk", package=package)
+
+    def fetch_info() -> Dict[str, str]:
+        apk_info = {}
+        out = run_command(["apk", "info", "-a", package])
+        if not out:
+            return apk_info
+        for line in out.splitlines():
+            if line.lower().startswith("repository"):
+                apk_info["repo"] = line.split(":", 1)[1].strip()
+        # Get description from apk info -d
+        desc_out = run_command(["apk", "info", "-d", package])
+        if desc_out:
+            # Format is "package-version description:\ndescription text"
+            lines = desc_out.strip().splitlines()
+            if len(lines) > 1:
+                apk_info["description"] = lines[1].strip()
+        return apk_info
+
+    apk_info = get_cached_info("apk", package, fetch_info)
+    repo = apk_info.get("repo")
+    if repo:
+        evidence.append(f"Repository: {repo}")
+
+    # Store package description in provenance
+    desc = apk_info.get("description")
+    if desc:
+        info.description = desc
+
+    verified = run_command_ok(["apk", "verify", "-q", package])
+    if verified is True:
+        evidence.append("Integrity verified (apk verify)")
+    elif verified is False:
+        evidence.append("Integrity verification failed (apk verify)")
+    else:
+        evidence.append("Integrity verification unavailable")
+    info.signature = "unknown"
+    info.evidence = evidence
+    return info
+
+
+def verify_xbps_provenance(binary_path: str) -> Optional[ProvenanceInfo]:
+    """Best-effort XBPS provenance (Void Linux)."""
+    if not shutil.which("xbps-query"):
+        return None
+
+    def resolve_owner() -> Optional[str]:
+        out = run_command(["xbps-query", "-o", binary_path])
+        if not out:
+            return None
+        line = out.strip().splitlines()[0]
+        if ":" in line:
+            return line.split(":", 1)[1].strip()
+        return None
+
+    package = get_cached_owner("xbps", binary_path, resolve_owner)
+    if not package:
+        return None
+
+    evidence = [f"Package: {package}", "Package manager: xbps"]
+    info = ProvenanceInfo(ownership="owned", signature="unknown", manager="xbps", package=package)
+
+    def fetch_info() -> Dict[str, str]:
+        xbps_info = {}
+        out = run_command(["xbps-query", "-p", "repository", package])
+        if out:
+            xbps_info["repo"] = out.strip()
+        # Get description
+        desc_out = run_command(["xbps-query", "-p", "short_desc", package])
+        if desc_out:
+            xbps_info["description"] = desc_out.strip()
+        return xbps_info
+
+    xbps_info = get_cached_info("xbps", package, fetch_info)
+    repo = xbps_info.get("repo")
+    if repo:
+        evidence.append(f"Repository: {repo}")
+
+    # Store package description in provenance
+    desc = xbps_info.get("description")
+    if desc:
+        info.description = desc
+
+    evidence.append("Remote repositories must be signed; per-package verification not available here")
+    info.signature = "unknown"
+    info.evidence = evidence
+    return info
+
+
+def verify_eopkg_provenance(binary_path: str) -> Optional[ProvenanceInfo]:
+    """Best-effort eopkg provenance (Solus)."""
+    if not shutil.which("eopkg"):
+        return None
+
+    def resolve_owner() -> Optional[str]:
+        out = run_command(["eopkg", "search-file", binary_path])
+        if not out:
+            return None
+        for line in out.splitlines():
+            if "Package Found:" in line:
+                return line.split(":", 1)[1].strip().split()[0]
+        for line in out.splitlines():
+            parts = line.split()
+            if parts:
+                return parts[0]
+        return None
+
+    package = get_cached_owner("eopkg", binary_path, resolve_owner)
+    if not package:
+        return None
+
+    evidence = [f"Package: {package}", "Package manager: eopkg"]
+    info = ProvenanceInfo(ownership="owned", signature="unknown", manager="eopkg", package=package)
+
+    def fetch_info() -> Dict[str, str]:
+        eopkg_info = {}
+        out = run_command(["eopkg", "info", package])
+        if not out:
+            return eopkg_info
+        for line in out.splitlines():
+            if line.lower().startswith("repository"):
+                eopkg_info["repo"] = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("summary"):
+                eopkg_info["description"] = line.split(":", 1)[1].strip()
+        return eopkg_info
+
+    eopkg_info = get_cached_info("eopkg", package, fetch_info)
+    repo = eopkg_info.get("repo")
+    if repo:
+        evidence.append(f"Repository: {repo}")
+
+    # Store package description in provenance
+    desc = eopkg_info.get("description")
+    if desc:
+        info.description = desc
+
+    evidence.append("Signature verification unavailable")
+    info.signature = "unknown"
+    info.evidence = evidence
+    return info
+
+
+def verify_swupd_provenance(binary_path: str) -> Optional[ProvenanceInfo]:
+    """Best-effort swupd provenance (Clear Linux)."""
+    if not shutil.which("swupd"):
+        return None
+
+    def resolve_owner() -> Optional[str]:
+        out = run_command(["swupd", "search-file", binary_path])
+        if not out:
+            return None
+        for line in out.splitlines():
+            if ":" in line:
+                return line.split(":", 1)[0].strip()
+        return None
+
+    bundle = get_cached_owner("swupd", binary_path, resolve_owner)
+    if not bundle:
+        return None
+
+    evidence = [f"Bundle: {bundle}", "Package manager: swupd"]
+    info = ProvenanceInfo(ownership="owned", signature="unknown", manager="swupd", package=bundle)
+    evidence.append("swupd uses signed manifests (chain of trust); not verified here")
+    info.signature = "unknown"
+    info.evidence = evidence
+    return info
+
+
+def verify_portage_provenance(binary_path: str) -> Optional[ProvenanceInfo]:
+    """Best-effort Portage provenance (Gentoo)."""
+    if not shutil.which("portageq"):
+        return None
+
+    def resolve_owner() -> Optional[str]:
+        out = run_command(["portageq", "owners", binary_path])
+        if not out:
+            return None
+        return out.strip().splitlines()[0].strip()
+
+    package = get_cached_owner("portage", binary_path, resolve_owner)
+    if not package:
+        return None
+
+    evidence = [f"Package: {package}", "Package manager: portage"]
+    info = ProvenanceInfo(ownership="owned", signature="unknown", manager="portage", package=package)
+    repo = ""
+    description = ""
+    db_path = Path("/var/db/pkg") / package
+    repo_file = db_path / "repository"
+    desc_file = db_path / "DESCRIPTION"
+    try:
+        if repo_file.exists():
+            repo = repo_file.read_text().strip()
+        if desc_file.exists():
+            description = desc_file.read_text().strip()
+    except (IOError, PermissionError):
+        pass
+
+    if repo:
+        evidence.append(f"Repository: {repo}")
+
+    # Store package description in provenance
+    if description:
+        info.description = description
+
+    evidence.append("Repository verification uses signed manifests; not verified here")
+    info.signature = "unknown"
+    info.evidence = evidence
+    return info
+
+
+def verify_nix_provenance(binary_path: str) -> Optional[ProvenanceInfo]:
+    """Best-effort Nix provenance."""
+    if not binary_path.startswith("/nix/store/"):
+        return None
+
+    parts = Path(binary_path).parts
+    try:
+        idx = parts.index("store")
+        store_item = parts[idx + 1]
+    except (ValueError, IndexError):
+        return None
+
+    package = store_item
+    if "-" in store_item:
+        package = store_item.split("-", 1)[1]
+    evidence = [f"Package: {package}", "Package manager: nix", "Nix store path"]
+    info = ProvenanceInfo(ownership="owned", signature="unknown", manager="nix", package=package)
+
+    verified = None
+    if shutil.which("nix"):
+        verified = run_command_ok(["nix", "store", "verify", "--no-contents", f"/nix/store/{store_item}"], timeout=20)
+        if verified is True:
+            evidence.append("Store signature verified (nix store verify --no-contents)")
+            info.signature = "third_party"
+            info.evidence = evidence
+            return info
+        if verified is False:
+            evidence.append("Store signature verification failed (nix store verify)")
+            info.signature = "unknown"
+            info.evidence = evidence
+            return info
+
+    if shutil.which("nix-store"):
+        verified = run_command_ok(["nix-store", "--verify-path", f"/nix/store/{store_item}"], timeout=20)
+        if verified is True:
+            evidence.append("Store path integrity verified (nix-store)")
+        elif verified is False:
+            evidence.append("Store path verification failed (nix-store)")
+        else:
+            evidence.append("Store verification unavailable (nix-store)")
+        info.signature = "unknown"
+        info.evidence = evidence
+        return info
+
+    evidence.append("Store verification unavailable")
+    info.signature = "unknown"
+    info.evidence = evidence
+    return info
+
+
+def _verify_through_systemd_parent(pid: int, proc_name: str, cgroup_path: str) -> Optional[Tuple[TrustLevel, ProvenanceInfo]]:
+    """
+    Verify a process by checking if its parent is systemd and systemd is package-owned.
+
+    For processes spawned directly by systemd (like sd-pam, internal helpers), we verify
+    through the parent chain rather than looking for a specific unit file.
+    """
+    try:
+        # Get parent PID
+        status_path = Path(f"/proc/{pid}/status")
+        if not status_path.exists():
+            return None
+
+        ppid = None
+        for line in status_path.read_text().splitlines():
+            if line.startswith("PPid:"):
+                ppid = int(line.split()[1])
+                break
+
+        if not ppid or ppid <= 1:
+            # For PID 1's children or orphans, check if this is under systemd cgroup
+            if ppid == 1 or "/systemd" in cgroup_path or "user@" in cgroup_path:
+                ppid = 1  # Use PID 1 as reference
+
+        # Check if parent is systemd
+        parent_comm_path = Path(f"/proc/{ppid}/comm")
+        if not parent_comm_path.exists():
+            return None
+
+        parent_comm = parent_comm_path.read_text().strip()
+
+        if parent_comm != "systemd":
+            # Check if grandparent is systemd (common for user session processes)
+            grandparent_status = Path(f"/proc/{ppid}/status")
+            if grandparent_status.exists():
+                for line in grandparent_status.read_text().splitlines():
+                    if line.startswith("PPid:"):
+                        gppid = int(line.split()[1])
+                        gp_comm_path = Path(f"/proc/{gppid}/comm")
+                        if gp_comm_path.exists():
+                            if gp_comm_path.read_text().strip() == "systemd":
+                                parent_comm = "systemd"
+                                ppid = gppid
+                        break
+
+        if parent_comm != "systemd":
+            return None
+
+        # Get the systemd binary path
+        systemd_exe_path = None
+        try:
+            systemd_exe_path = os.readlink(f"/proc/{ppid}/exe")
+            systemd_exe_path = systemd_exe_path.replace(" (deleted)", "")
+        except (OSError, PermissionError):
+            # Can't read exe, try common paths
+            for candidate in ["/usr/lib/systemd/systemd", "/lib/systemd/systemd", "/usr/bin/systemd"]:
+                if os.path.exists(candidate):
+                    systemd_exe_path = candidate
+                    break
+
+        if not systemd_exe_path:
+            return None
+
+        # Verify systemd binary is owned by a package
+        evidence = [
+            f"Process spawned by systemd (PID {ppid})",
+            f"Cgroup: {cgroup_path}",
+            f"Systemd binary: {systemd_exe_path}",
+        ]
+
+        # Check with dpkg
+        if shutil.which("dpkg"):
+            out = run_command(["dpkg", "-S", systemd_exe_path])
+            if out:
+                package = out.split(":")[0].strip()
+                evidence.append(f"Parent systemd from package: {package}")
+                evidence.append("Verified through systemd parent chain")
+                info = ProvenanceInfo(
+                    ownership="owned",
+                    signature="official",
+                    manager="systemd",
+                    package=package,
+                    evidence=evidence
+                )
+                return TrustLevel.OFFICIAL_REPO, info
+
+        # Check with rpm
+        if shutil.which("rpm"):
+            out = run_command(["rpm", "-qf", systemd_exe_path])
+            if out and "not owned" not in out.lower():
+                package = out.strip().split()[0]
+                evidence.append(f"Parent systemd from package: {package}")
+                evidence.append("Verified through systemd parent chain")
+                info = ProvenanceInfo(
+                    ownership="owned",
+                    signature="official",
+                    manager="systemd",
+                    package=package,
+                    evidence=evidence
+                )
+                return TrustLevel.OFFICIAL_REPO, info
+
+        # Check with pacman
+        if shutil.which("pacman"):
+            out = run_command(["pacman", "-Qo", systemd_exe_path])
+            if out and "owned by" in out.lower():
+                match = re.search(r'owned by (\S+)', out)
+                if match:
+                    package = match.group(1)
+                    evidence.append(f"Parent systemd from package: {package}")
+                    evidence.append("Verified through systemd parent chain")
+                    info = ProvenanceInfo(
+                        ownership="owned",
+                        signature="official",
+                        manager="systemd",
+                        package=package,
+                        evidence=evidence
+                    )
+                    return TrustLevel.OFFICIAL_REPO, info
+
+    except (OSError, ValueError, PermissionError):
+        pass
+
+    return None
+
+
+def verify_systemd_unit_provenance(pid: int, proc_name: str) -> Optional[Tuple[TrustLevel, ProvenanceInfo]]:
+    """
+    Verify if a process is a legitimate systemd service by checking unit file provenance.
+
+    This handles cases where we can't read /proc/PID/exe (permission denied) but the
+    process is actually a systemd-managed service with a unit file owned by a package.
+    """
+    # Get cgroup to find the systemd unit name
+    unit_name = None
+    cgroup_path_str = ""
+    try:
+        cgroup_path = f"/proc/{pid}/cgroup"
+        with open(cgroup_path) as f:
+            for line in f:
+                # Format: hierarchy-ID:controller-list:cgroup-path
+                # e.g., "0::/user.slice/user-1000.slice/session-2.scope"
+                # or "0::/system.slice/avahi-daemon.service"
+                parts = line.strip().split(":")
+                if len(parts) >= 3:
+                    cgroup_path_str = parts[2]
+                    # Look for .service, .scope, .slice units
+                    match = re.search(r'/([^/]+\.(service|scope|slice|socket))$', cgroup_path_str)
+                    if match:
+                        unit_name = match.group(1)
+                        break
+                    # Also check for user session units
+                    match = re.search(r'session-\d+\.scope', cgroup_path_str)
+                    if match:
+                        unit_name = match.group(0)
+                        break
+    except (IOError, PermissionError):
+        pass
+
+    # Check for processes spawned directly by systemd (user or system)
+    # If parent is systemd and the systemd binary is package-owned, verify through parent chain
+    if "user@" in cgroup_path_str or "/init.scope" in cgroup_path_str or "/system.slice" in cgroup_path_str:
+        result = _verify_through_systemd_parent(pid, proc_name, cgroup_path_str)
+        if result:
+            return result
+
+    if not unit_name:
+        return None
+
+    # Search for the unit file in standard locations
+    unit_dirs = [
+        "/lib/systemd/system",
+        "/usr/lib/systemd/system",
+        "/etc/systemd/system",
+        "/run/systemd/system",  # Transient system units
+        "/run/systemd/user",    # Transient user units
+        f"/home/{os.environ.get('USER', '')}/.config/systemd/user",
+        "/usr/lib/systemd/user",
+        "/etc/systemd/user",
+    ]
+
+    unit_file_path = None
+    for unit_dir in unit_dirs:
+        candidate = os.path.join(unit_dir, unit_name)
+        if os.path.exists(candidate):
+            unit_file_path = candidate
+            break
+        # Try without the instance part for template units (e.g., getty@tty1.service -> getty@.service)
+        if "@" in unit_name:
+            template_name = re.sub(r'@[^.]*\.', '@.', unit_name)
+            candidate = os.path.join(unit_dir, template_name)
+            if os.path.exists(candidate):
+                unit_file_path = candidate
+                break
+
+    if not unit_file_path:
+        # For session scopes, check if parent is systemd and the process is expected
+        if ".scope" in unit_name:
+            try:
+                ppid_status = Path(f"/proc/{pid}/status")
+                if ppid_status.exists():
+                    for line in ppid_status.read_text().splitlines():
+                        if line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                            # Check if parent is systemd (PID 1) or user systemd
+                            parent_comm = Path(f"/proc/{ppid}/comm")
+                            if parent_comm.exists() and parent_comm.read_text().strip() == "systemd":
+                                # This is a session-managed process under systemd
+                                # Try to verify based on the process name matching a known package
+                                return _verify_process_name_package(proc_name, unit_name)
+            except (OSError, ValueError):
+                pass
+        return None
+
+    # Verify the unit file is owned by a package
+    evidence = [f"Systemd unit: {unit_name}", f"Unit file: {unit_file_path}"]
+
+    # Check with dpkg first
+    if shutil.which("dpkg"):
+        out = run_command(["dpkg", "-S", unit_file_path])
+        if out:
+            package = out.split(":")[0].strip()
+            evidence.append(f"Package: {package}")
+            evidence.append("Unit file owned by system package")
+            info = ProvenanceInfo(
+                ownership="owned",
+                signature="official",
+                manager="systemd/dpkg",
+                package=package,
+                evidence=evidence
+            )
+            return TrustLevel.OFFICIAL_REPO, info
+
+    # Check with rpm
+    if shutil.which("rpm"):
+        out = run_command(["rpm", "-qf", unit_file_path])
+        if out and "not owned" not in out.lower():
+            package = out.strip().split()[0]
+            evidence.append(f"Package: {package}")
+            evidence.append("Unit file owned by system package")
+            info = ProvenanceInfo(
+                ownership="owned",
+                signature="official",
+                manager="systemd/rpm",
+                package=package,
+                evidence=evidence
+            )
+            return TrustLevel.OFFICIAL_REPO, info
+
+    # Check with pacman
+    if shutil.which("pacman"):
+        out = run_command(["pacman", "-Qo", unit_file_path])
+        if out and "owned by" in out.lower():
+            match = re.search(r'owned by (\S+)', out)
+            if match:
+                package = match.group(1)
+                evidence.append(f"Package: {package}")
+                evidence.append("Unit file owned by system package")
+                info = ProvenanceInfo(
+                    ownership="owned",
+                    signature="official",
+                    manager="systemd/pacman",
+                    package=package,
+                    evidence=evidence
+                )
+                return TrustLevel.OFFICIAL_REPO, info
+
+    # Unit file exists but isn't owned by a package - might be user-created
+    evidence.append("Unit file not owned by any package (possibly user-created)")
+    info = ProvenanceInfo(
+        ownership="unowned",
+        signature="unknown",
+        manager="systemd",
+        package="",
+        evidence=evidence
+    )
+    return TrustLevel.USER_LOCAL, info
+
+
+def _verify_process_name_package(proc_name: str, unit_name: str) -> Optional[Tuple[TrustLevel, ProvenanceInfo]]:
+    """
+    Try to verify a process by checking if a binary with its name is owned by a package.
+    Used for session-scoped processes where we can't directly verify.
+    """
+    # Clean up process name (remove parentheses like in "(sd-pam)")
+    clean_name = proc_name.strip("()")
+
+    # Common paths where the binary might be
+    search_paths = [
+        f"/usr/lib/systemd/{clean_name}",
+        f"/lib/systemd/{clean_name}",
+        f"/usr/libexec/{clean_name}",
+        f"/usr/bin/{clean_name}",
+        f"/usr/sbin/{clean_name}",
+    ]
+
+    for search_path in search_paths:
+        if not os.path.exists(search_path):
+            continue
+
+        evidence = [f"Systemd scope: {unit_name}", f"Binary found: {search_path}"]
+
+        # Check with dpkg
+        if shutil.which("dpkg"):
+            out = run_command(["dpkg", "-S", search_path])
+            if out:
+                package = out.split(":")[0].strip()
+                evidence.append(f"Package: {package}")
+                evidence.append("Binary owned by system package")
+                info = ProvenanceInfo(
+                    ownership="owned",
+                    signature="official",
+                    manager="systemd/dpkg",
+                    package=package,
+                    evidence=evidence
+                )
+                return TrustLevel.OFFICIAL_REPO, info
+
+        # Check with rpm
+        if shutil.which("rpm"):
+            out = run_command(["rpm", "-qf", search_path])
+            if out and "not owned" not in out.lower():
+                package = out.strip().split()[0]
+                evidence.append(f"Package: {package}")
+                evidence.append("Binary owned by system package")
+                info = ProvenanceInfo(
+                    ownership="owned",
+                    signature="official",
+                    manager="systemd/rpm",
+                    package=package,
+                    evidence=evidence
+                )
+                return TrustLevel.OFFICIAL_REPO, info
+
+    return None
+
+
+def verify_package_provenance(binary_path: str) -> Tuple[TrustLevel, ProvenanceInfo]:
+    """Try multiple package managers to verify provenance."""
+    if not binary_path or not os.path.exists(binary_path):
+        return TrustLevel.UNKNOWN, ProvenanceInfo(ownership="unknown", signature="unknown")
+
+    resolved_path = os.path.realpath(binary_path)
+
+    nix_result = verify_nix_provenance(resolved_path)
+    if nix_result:
+        level = TrustLevel.THIRD_PARTY_REPO
+        if nix_result.signature == "official":
+            level = TrustLevel.OFFICIAL_REPO
+        return level, nix_result
+
+    if file_package_cache.get(resolved_path):
+        info, level = verify_apt_provenance(resolved_path)
+        return level, info
+
+    # Prefer environment-specific managers first
+    preferred = []
+    if shutil.which("rpm"):
+        preferred.append(verify_rpm_provenance)
+    if shutil.which("pacman"):
+        preferred.append(verify_pacman_provenance)
+    if shutil.which("apk"):
+        preferred.append(verify_apk_provenance)
+    if shutil.which("xbps-query"):
+        preferred.append(verify_xbps_provenance)
+    if shutil.which("eopkg"):
+        preferred.append(verify_eopkg_provenance)
+    if shutil.which("swupd"):
+        preferred.append(verify_swupd_provenance)
+    if shutil.which("portageq"):
+        preferred.append(verify_portage_provenance)
+
+    for verifier in preferred:
+        info = verifier(resolved_path)
+        if info:
+            level = TrustLevel.THIRD_PARTY_REPO
+            if info.signature == "official":
+                level = TrustLevel.OFFICIAL_REPO
+            elif info.signature == "unknown":
+                level = TrustLevel.UNKNOWN
+            return level, info
+
+    return TrustLevel.UNKNOWN, ProvenanceInfo(ownership="unowned", signature="unknown")
+
+
+# =============================================================================
+# Container Detection
+# =============================================================================
+
+def detect_container(pid: int) -> Tuple[bool, List[str]]:
+    """
+    Detect if a process is running in a container.
+    Returns: (is_container, evidence)
+    Decision rule: require >= 2 independent signals
+    """
+    evidence = []
+    signals = 0
+
+    # Signal 1: Marker files (from process's perspective)
+    try:
+        proc_root = f"/proc/{pid}/root"
+        for marker in ["/.dockerenv", "/run/.containerenv"]:
+            marker_path = proc_root + marker
+            if os.path.exists(marker_path):
+                evidence.append(f"Container marker: {marker}")
+                signals += 1
+                break
+    except (OSError, PermissionError):
+        pass
+
+    # Note: systemd-detect-virt reports HOST environment, not per-PID
+    # So we only use it as informational evidence, not as a signal
+    try:
+        result = subprocess.run(
+            ["systemd-detect-virt", "--container"],
+            capture_output=True, text=True, timeout=5
+        )
+        virt = result.stdout.strip()
+        if result.returncode == 0 and virt and virt not in ["none", ""]:
+            evidence.append(f"systemd-detect-virt (host): {virt}")
+            # Don't increment signals - this is host-level, not PID-specific
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Signal 3: PID namespace differs from host
+    try:
+        proc_ns = os.readlink(f"/proc/{pid}/ns/pid")
+        host_ns = os.readlink("/proc/1/ns/pid")
+        if proc_ns != host_ns:
+            evidence.append("PID namespace differs from host")
+            signals += 1
+    except (OSError, PermissionError):
+        pass
+
+    # Signal 4: cgroup indicates container runtime
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            cgroup = f.read()
+            if re.search(r"(docker|kubepods|containerd|libpod|podman|lxc)", cgroup):
+                evidence.append("Cgroup indicates container runtime")
+                signals += 1
+    except (IOError, PermissionError):
+        pass
+
+    # Signal 5: /proc/<pid>/root is not /
+    try:
+        root = os.readlink(f"/proc/{pid}/root")
+        if root != "/":
+            evidence.append(f"Process root: {root}")
+            signals += 1
+    except (OSError, PermissionError):
+        pass
+
+    return (signals >= 2), evidence
+
+
+# =============================================================================
+# Process Classification
+# =============================================================================
+
+def is_flatpak_process(path: str, cmdline: str) -> bool:
+    """Check if process is a Flatpak application."""
+    return (
+        path.startswith("/var/lib/flatpak/") or
+        path.startswith(str(Path.home() / ".local/share/flatpak/")) or
+        "/flatpak/" in path or
+        "flatpak" in cmdline.lower()
+    )
+
+
+def is_snap_process(path: str) -> bool:
+    """Check if process is a Snap application."""
+    return path.startswith("/snap/") or "/snap/" in path
+
+
+def is_appimage_process(path: str, cmdline: str) -> bool:
+    """Check if process is an AppImage."""
+    return (
+        ".AppImage" in path or
+        ".appimage" in path.lower() or
+        "/tmp/.mount_" in path
+    )
+
+
+def is_user_local(path: str) -> bool:
+    """Check if process is from user local directories."""
+    home = str(Path.home())
+    return (
+        path.startswith(f"{home}/.local/bin/") or
+        path.startswith(f"{home}/bin/") or
+        path.startswith("/usr/local/bin/") or
+        path.startswith("/usr/local/sbin/")
+    )
+
+
+def is_kernel_thread(proc: ProcessInfo) -> bool:
+    """Check if process is a kernel thread."""
+    # Kernel threads have no executable (path is empty or doesn't exist)
+    # and typically have PPID of 2 (kthreadd) or are kthreadd itself (PID 2)
+    if proc.pid == 2:
+        return True
+    if proc.ppid == 2:
+        return True
+    # Kernel threads have empty or non-existent paths
+    if not proc.path:
+        # Check if process is in kernel space by looking at /proc/PID/exe
+        try:
+            exe_link = f"/proc/{proc.pid}/exe"
+            if os.path.islink(exe_link):
+                target = os.readlink(exe_link)
+                # Kernel threads often show as empty or special
+                if not target or "(deleted)" in target:
+                    return True
+            else:
+                # No exe link at all - likely kernel thread
+                return True
+        except (OSError, PermissionError):
+            # Can't read - check other signals
+            pass
+        # Check cmdline - kernel threads often have empty cmdline
+        if not proc.cmdline:
+            return True
+    return False
+
+
+def extract_path_from_cmdline(cmdline: str) -> Optional[str]:
+    """Extract binary path from cmdline when /proc/PID/exe is not accessible."""
+    if not cmdline:
+        return None
+
+    # Get first argument (the binary)
+    parts = cmdline.split()
+    if not parts:
+        return None
+
+    candidate = parts[0]
+
+    # Handle absolute paths
+    if candidate.startswith("/"):
+        if os.path.isfile(candidate):
+            return candidate
+        return None
+
+    # Try to resolve relative binary names through common system paths
+    system_paths = [
+        "/usr/bin", "/usr/sbin", "/bin", "/sbin",
+        "/usr/lib/systemd", "/lib/systemd",
+        "/usr/libexec", "/usr/local/bin", "/usr/local/sbin"
+    ]
+
+    for sys_path in system_paths:
+        full_path = os.path.join(sys_path, candidate)
+        if os.path.isfile(full_path):
+            return full_path
+
+    # Try using shutil.which as last resort
+    resolved = shutil.which(candidate)
+    if resolved:
+        return resolved
+
+    return None
+
+
+def classify_process(proc: ProcessInfo) -> Tuple[TrustLevel, List[str]]:
+    """Classify a process and determine its trust level."""
+    path = proc.path
+    cmdline = proc.cmdline
+    evidence = []
+
+    # Check kernel threads first (before container check)
+    if is_kernel_thread(proc):
+        evidence.append("Kernel thread")
+        return TrustLevel.KERNEL, evidence
+
+    # Check container
+    is_container, container_evidence = detect_container(proc.pid)
+    if is_container:
+        proc.is_container = True
+        proc.container_evidence = container_evidence
+        return TrustLevel.CONTAINER, container_evidence
+
+    # Try to extract path from cmdline if not available (permission issue)
+    if not path and cmdline:
+        path = extract_path_from_cmdline(cmdline)
+        if path:
+            proc.path = path  # Update for display
+            evidence.append("Path extracted from cmdline")
+
+    # Check Flatpak
+    if is_flatpak_process(path or "", cmdline):
+        evidence.append(f"Flatpak path: {path or cmdline}")
+        return TrustLevel.FLATPAK, evidence
+
+    # Check Snap
+    if is_snap_process(path or ""):
+        evidence.append(f"Snap path: {path}")
+        return TrustLevel.SNAP, evidence
+
+    # Check AppImage
+    if is_appimage_process(path or "", cmdline):
+        evidence.append(f"AppImage detected: {path or cmdline}")
+        return TrustLevel.APPIMAGE, evidence
+
+    # Check user local
+    if is_user_local(path or ""):
+        evidence.append(f"User local path: {path}")
+        return TrustLevel.USER_LOCAL, evidence
+
+    # Check package provenance
+    if path and os.path.exists(path):
+        level, info = verify_package_provenance(path)
+        proc.provenance = info
+        # Apply package description as cached_description if available
+        if info.description and not proc.cached_description:
+            proc.cached_description = info.description
+        return level, info.evidence
+
+    # Try systemd unit verification for processes without accessible binary paths
+    # This handles cases like sd-pam where we can't read /proc/PID/exe
+    systemd_result = verify_systemd_unit_provenance(proc.pid, proc.name)
+    if systemd_result:
+        level, info = systemd_result
+        proc.provenance = info
+        # Apply package description as cached_description if available
+        if info.description and not proc.cached_description:
+            proc.cached_description = info.description
+        return level, info.evidence
+
+    return TrustLevel.UNKNOWN, ["No binary path available"]
+
+
+# =============================================================================
+# Collectors: Process Collection
+# =============================================================================
+
+def get_processes_osquery() -> Optional[List[ProcessInfo]]:
+    """Get process list using osquery."""
+    osquery_path = shutil.which("osqueryi")
+    if not osquery_path:
+        return None
+
+    try:
+        debug_log("osquery", f"running {osquery_path}")
+        query = """
+        SELECT
+            p.pid, p.name, p.path, p.cmdline, p.uid,
+            p.parent as ppid, p.resident_size
+        FROM processes p
+        WHERE p.pid > 1
+        """
+
+        result = subprocess.run(
+            [osquery_path, "--json", query],
+            capture_output=True, text=True, timeout=30
+        )
+        debug_log("osquery", f"completed rc={result.returncode}")
+
+        if result.returncode != 0:
+            report_collector_error("osquery_failed")
+            return None
+
+        data = json.loads(result.stdout)
+        processes = []
+
+        for row in data:
+            try:
+                uid = int(row.get("uid", 0))
+                pid = int(row.get("pid", 0))
+                exe_deleted = is_exe_deleted(pid)
+                is_memfd, memfd_evidence = is_memfd_or_anonymous(pid)
+                username = get_username(uid)
+                path = normalize_exe_path(row.get("path", ""))
+
+                proc = ProcessInfo(
+                    pid=pid,
+                    name=row.get("name", ""),
+                    path=path,
+                    cmdline=normalize_cmdline(row.get("cmdline", "")),
+                    uid=uid,
+                    username=username,
+                    ppid=int(row.get("ppid", 0)),
+                    memory_mb=int(row.get("resident_size", 0)) / (1024 * 1024),
+                    is_deleted=exe_deleted,
+                    is_memfd=is_memfd,
+                    memfd_evidence=memfd_evidence
+                )
+                processes.append(proc)
+            except (ValueError, TypeError):
+                continue
+
+        return processes
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        report_collector_error("osquery_error")
+        return None
+
+
+def get_processes_proc() -> List[ProcessInfo]:
+    """Get process list from /proc filesystem."""
+    processes = []
+
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+
+        pid = int(pid_dir.name)
+        if pid <= 1:  # Skip init
+            continue
+
+        try:
+            # Read process info
+            comm_path = pid_dir / "comm"
+            name = comm_path.read_text().strip() if comm_path.exists() else ""
+
+            # Get executable path (raw, may contain "(deleted)")
+            exe_path = pid_dir / "exe"
+            raw_path = ""
+            try:
+                raw_path = os.readlink(exe_path)
+            except (OSError, PermissionError):
+                raw_path = ""
+
+            # Check for deleted executable
+            exe_deleted = "(deleted)" in raw_path
+
+            # Normalize path (strip "(deleted)" suffix)
+            path = normalize_exe_path(raw_path)
+
+            # Check for memfd/anonymous execution
+            is_memfd, memfd_evidence = is_memfd_or_anonymous(pid)
+
+            # Get command line
+            cmdline_path = pid_dir / "cmdline"
+            try:
+                cmdline = cmdline_path.read_bytes().replace(b'\x00', b' ').decode('utf-8', errors='replace').strip()
+                cmdline = normalize_cmdline(cmdline)
+            except (IOError, PermissionError):
+                cmdline = ""
+
+            # Get UID from status
+            status_path = pid_dir / "status"
+            uid = 0
+            ppid = 0
+            memory_kb = 0
+
+            if status_path.exists():
+                try:
+                    for line in status_path.read_text().split("\n"):
+                        if line.startswith("Uid:"):
+                            uid = int(line.split()[1])
+                        elif line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                        elif line.startswith("VmRSS:"):
+                            memory_kb = int(line.split()[1])
+                except (IOError, PermissionError, ValueError, IndexError):
+                    pass
+
+            # Get username from UID
+            username = get_username(uid)
+
+            proc = ProcessInfo(
+                pid=pid,
+                name=name,
+                path=path,
+                cmdline=cmdline,
+                uid=uid,
+                username=username,
+                ppid=ppid,
+                memory_mb=memory_kb / 1024,
+                is_deleted=exe_deleted,
+                is_memfd=is_memfd,
+                memfd_evidence=memfd_evidence
+            )
+            processes.append(proc)
+
+        except (IOError, PermissionError, ProcessLookupError):
+            continue
+
+    return processes
+
+
+def get_processes() -> List[ProcessInfo]:
+    """Get list of all processes, preferring osquery if available."""
+    # Try osquery first
+    processes = get_processes_osquery()
+    if processes:
+        return processes
+
+    if shutil.which("osqueryi"):
+        report_collector_error("osquery_unavailable_fallback")
+
+    # Fall back to /proc parsing
+    return get_processes_proc()
+
+
+# =============================================================================
+# Collectors: Network Activity
+# =============================================================================
+
+def get_process_connections(pid: int, include_listen: bool = False) -> List[NetworkConnection]:
+    """Get network connections for a specific process."""
+    connections = []
+
+    # Try ss command first
+    try:
+        result = subprocess.run(
+            ["ss", "-H", "-tupn", f"pid = {pid}"],
+            capture_output=True, text=True, timeout=10
+        )
+
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                proto = line.split(None, 1)[0]
+            except IndexError:
+                continue
+            # Strip users:(...) to avoid column shifts
+            line_no_users = line.split(" users:", 1)[0]
+            parts = line_no_users.split()
+            if len(parts) >= 6:
+                try:
+                    local = parts[-2]
+                    remote = parts[-1]
+                    state = parts[1] if len(parts) > 1 else ""
+
+                    # Parse addresses
+                    local_addr, local_port = parse_address(local)
+                    remote_addr, remote_port = parse_address(remote)
+
+                    if remote_addr is None:
+                        continue
+                    if (not include_listen) and remote_addr in ["", "*", "0.0.0.0", "::"]:
+                        continue
+
+                    conn = NetworkConnection(
+                        local_address=local_addr,
+                        local_port=local_port,
+                        remote_address=remote_addr,
+                        remote_port=remote_port,
+                        state=state,
+                        protocol=proto
+                    )
+                    connections.append(conn)
+                except (ValueError, IndexError):
+                    continue
+
+        if connections:
+            return connections
+        # If ss returned nothing, fall through to /proc/net parsing
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Fall back to parsing /proc/net
+    # First try to get socket inodes from process fd directory
+    socket_inodes = set()
+    process_uid = None
+
+    try:
+        fd_dir = Path(f"/proc/{pid}/fd")
+        if fd_dir.exists():
+            for fd in fd_dir.iterdir():
+                try:
+                    link = os.readlink(fd)
+                    if link.startswith("socket:["):
+                        inode = link[8:-1]
+                        socket_inodes.add(inode)
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        pass
+
+    # If we couldn't read fd directory (permission denied), fall back to UID matching
+    if not socket_inodes:
+        try:
+            status_path = Path(f"/proc/{pid}/status")
+            if status_path.exists():
+                for line in status_path.read_text().splitlines():
+                    if line.startswith("Uid:"):
+                        process_uid = int(line.split()[1])
+                        break
+        except (OSError, PermissionError, ValueError):
+            pass
+
+    # Parse /proc/net/tcp, tcp6, udp, and udp6
+    proto_files = [
+        ("/proc/net/tcp", "tcp"),
+        ("/proc/net/tcp6", "tcp"),
+        ("/proc/net/udp", "udp"),
+        ("/proc/net/udp6", "udp"),
+    ]
+
+    for proto_file, proto_name in proto_files:
+        if not os.path.exists(proto_file):
+            continue
+
+        try:
+            with open(proto_file) as f:
+                for line in f.readlines()[1:]:  # Skip header
+                    parts = line.split()
+                    if len(parts) >= 10:
+                        inode = parts[9]
+                        socket_uid = int(parts[7]) if len(parts) > 7 else -1
+
+                        # Match by inode if available, otherwise by UID
+                        match = False
+                        if socket_inodes and inode in socket_inodes:
+                            match = True
+                        elif process_uid is not None and socket_uid == process_uid:
+                            match = True
+
+                        if match:
+                            local = parts[1]
+                            remote = parts[2]
+                            state_hex = parts[3]
+
+                            local_addr, local_port = parse_hex_address(local)
+                            remote_addr, remote_port = parse_hex_address(remote)
+
+                            if remote_addr is None:
+                                continue
+
+                            # For UDP, state 07 means listening (UNCONN)
+                            if proto_name == "udp":
+                                state = "LISTEN" if state_hex == "07" else "ESTABLISHED"
+                            else:
+                                state = decode_tcp_state(state_hex)
+
+                            if (not include_listen) and state == "LISTEN":
+                                continue
+
+                            conn = NetworkConnection(
+                                local_address=local_addr,
+                                local_port=local_port,
+                                remote_address=remote_addr,
+                                remote_port=remote_port,
+                                state=state,
+                                protocol=proto_name
+                            )
+                            connections.append(conn)
+        except (IOError, PermissionError):
+            continue
+
+    return connections
+
+
+def parse_address(addr: str) -> Tuple[str, int]:
+    """Parse address:port string."""
+    if not addr or addr == "*":
+        return "", 0
+
+    # Handle IPv6 format [addr]:port
+    if addr.startswith("["):
+        match = re.match(r'\[([^\]]+)\]:(\d+)', addr)
+        if match:
+            return match.group(1), int(match.group(2))
+
+    # Handle IPv4 format addr:port
+    if ":" in addr:
+        parts = addr.rsplit(":", 1)
+        if len(parts) == 2:
+            try:
+                return parts[0], int(parts[1])
+            except ValueError:
+                pass
+
+    return addr, 0
+
+
+def parse_hex_address(hex_addr: str) -> Tuple[str, int]:
+    """Parse hex-encoded address from /proc/net/tcp."""
+    try:
+        addr, port = hex_addr.split(":")
+        port = int(port, 16)
+
+        # IPv4
+        if len(addr) == 8:
+            # Reverse byte order
+            ip = ".".join(str(int(addr[i:i+2], 16)) for i in range(6, -1, -2))
+            return ip, port
+
+        # IPv6
+        if len(addr) == 32:
+            # Convert to IPv6 format
+            parts = [addr[i:i+4] for i in range(0, 32, 4)]
+            ip = ":".join(parts)
+            return ip, port
+
+    except (ValueError, IndexError):
+        pass
+
+    return "", 0
+
+
+def decode_tcp_state(state_hex: str) -> str:
+    """Decode TCP state hex from /proc/net/tcp into a name."""
+    states = {
+        "01": "ESTABLISHED",
+        "02": "SYN_SENT",
+        "03": "SYN_RECV",
+        "04": "FIN_WAIT1",
+        "05": "FIN_WAIT2",
+        "06": "TIME_WAIT",
+        "07": "CLOSE",
+        "08": "CLOSE_WAIT",
+        "09": "LAST_ACK",
+        "0A": "LISTEN",
+        "0B": "CLOSING",
+        "0C": "NEW_SYN_RECV",
+    }
+    return states.get(state_hex.upper(), "")
+
+
+def is_private_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+        return ip.is_private
+    except ValueError:
+        return False
+
+
+def is_loopback_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+        return ip.is_loopback
+    except ValueError:
+        return False
+
+
+def is_link_local_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+        return ip.is_link_local
+    except ValueError:
+        return False
+
+
+def in_allowed_networks(addr: str, nets: List[str]) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+        for n in nets:
+            try:
+                if ip in ipaddress.ip_network(n, strict=False):
+                    return True
+            except ValueError:
+                continue
+    except ValueError:
+        return False
+    return False
+
+
+def enrich_connections(conns: List[NetworkConnection]) -> None:
+    """Best-effort reverse DNS for public IPs."""
+    old_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(1.0)
+        for conn in conns:
+            addr = conn.remote_address
+            if not is_ip_literal(addr):
+                continue
+            if is_private_ip(addr) or is_loopback_ip(addr) or is_link_local_ip(addr):
+                continue
+            try:
+                host, _, _ = socket.gethostbyaddr(addr)
+                conn.hostname = host
+            except (socket.herror, socket.gaierror, TimeoutError):
+                conn.hostname = ""
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
+# =============================================================================
+# Weirdness Scoring
+# =============================================================================
+
+def load_user_trusted() -> Set[str]:
+    """Load user-trusted processes from config file."""
+    trusted = set()
+
+    if USER_TRUSTED_FILE.exists():
+        try:
+            with open(USER_TRUSTED_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        trusted.add(line)
+        except (IOError, PermissionError):
+            pass
+
+    return trusted
+
+
+def is_random_looking_name(name: str) -> bool:
+    """
+    Check if a process name looks randomly generated.
+
+    Uses allowlist to reduce false positives on legitimate system processes
+    that happen to have consonant-heavy names (gvfsd, sshd, etc.)
+    """
+    if not name or len(name) < 5:
+        return False
+
+    name_lower = name.lower()
+
+    # Check against known legitimate process names that might look random
+    if name_lower in LEGITIMATE_RANDOM_LOOKING:
+        return False
+
+    # Also check if name starts with a known legitimate prefix
+    legitimate_prefixes = ("gvfs", "xfce", "xfwm", "kde", "gnome-", "systemd-", "dbus-")
+    if any(name_lower.startswith(prefix) for prefix in legitimate_prefixes):
+        return False
+
+    # Check for high entropy patterns
+    # Long strings of only consonants (very suspicious)
+    if re.match(r'^[bcdfghjklmnpqrstvwxz]{6,}$', name_lower):
+        debug_log("random_name", f"Flagged consonant-only name: {name}")
+        return True
+
+    # Long hex-only strings (common in malware)
+    if re.match(r'^[a-f0-9]{12,}$', name_lower):
+        debug_log("random_name", f"Flagged hex-only name: {name}")
+        return True
+
+    # Check consonant-to-vowel ratio (more conservative threshold)
+    consonants = sum(1 for c in name_lower if c in "bcdfghjklmnpqrstvwxz")
+    vowels = sum(1 for c in name_lower if c in "aeiou")
+
+    # Only flag if very extreme ratio AND longer name
+    if len(name) > 8 and vowels > 0 and consonants / vowels > 6:
+        debug_log("random_name", f"Flagged high consonant ratio: {name} ({consonants}/{vowels})")
+        return True
+
+    # Names with no vowels at all and longer than 6 chars
+    if vowels == 0 and len(name) > 6 and name_lower.isalpha():
+        debug_log("random_name", f"Flagged no-vowel name: {name}")
+        return True
+
+    return False
+
+
+def _get_parent_process_name(pid: int) -> str:
+    """Get the name of a process's parent."""
+    try:
+        status_path = f"/proc/{pid}/status"
+        ppid = None
+        with open(status_path) as f:
+            for line in f:
+                if line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+                    break
+        if ppid and ppid > 1:
+            comm_path = f"/proc/{ppid}/comm"
+            with open(comm_path) as f:
+                return f.read().strip().lower()
+    except (IOError, PermissionError, ValueError):
+        pass
+    return ""
+
+
+def _has_controlling_terminal(pid: int) -> bool:
+    """Check if process has a controlling terminal (interactive session)."""
+    try:
+        stat_path = f"/proc/{pid}/stat"
+        with open(stat_path) as f:
+            stat_data = f.read()
+            # Field 7 (tty_nr) - 0 means no controlling terminal
+            # Format: pid (comm) state ppid pgrp session tty_nr ...
+            # Find the closing paren to skip comm field (may contain spaces)
+            close_paren = stat_data.rfind(')')
+            if close_paren > 0:
+                fields = stat_data[close_paren+2:].split()
+                if len(fields) >= 5:
+                    tty_nr = int(fields[4])  # tty_nr is field 7, index 4 after comm
+                    return tty_nr != 0
+    except (IOError, PermissionError, ValueError, IndexError):
+        pass
+    return False
+
+
+def is_bare_interpreter(proc: ProcessInfo) -> bool:
+    """Check if process is a bare interpreter without a clear script."""
+    name = proc.name.lower()
+    cmdline = proc.cmdline
+
+    # Check if it's an interpreter
+    if name not in INTERPRETERS and not any(name.startswith(i) for i in INTERPRETERS):
+        return False
+
+    # Check if parent is a known IDE/development environment - these are normal
+    parent_name = _get_parent_process_name(proc.pid)
+    if parent_name in IDE_PARENT_PROCESSES:
+        return False
+
+    # Check if process has a controlling terminal (interactive REPL usage is normal)
+    if _has_controlling_terminal(proc.pid):
+        return False
+
+    # Check if running a script (has additional arguments)
+    parts = cmdline.split()
+    if len(parts) <= 1:
+        return True  # Just the interpreter, no script
+
+    # Check if second argument looks like a script file
+    if len(parts) > 1:
+        second = parts[1]
+
+        # These flags indicate the interpreter IS running code, not bare
+        # -m module : running a module (python -m pytest)
+        # -c "code" : inline code (python -c "print('hi')")
+        # -e "code" : inline code for perl/ruby/node
+        if second in ["-m", "-c"]:
+            return False  # Running module or inline code
+
+        # node/nodejs specific
+        if name in ["node", "nodejs"] and second in ["-e", "-p", "--eval", "--print"]:
+            return False  # Running inline code
+
+        # perl/ruby specific
+        if name in ["perl", "ruby"] and second == "-e":
+            return False  # Running inline code
+
+        if second.startswith("-"):
+            # Other flag, check if there's more arguments
+            if len(parts) <= 2:
+                return True  # Just interpreter + flag, no code
+            # Has more args after the flag - probably has code/script
+            return False
+        elif os.path.exists(second):
+            return False  # Running a specific script
+
+    return False
+
+
+def detect_weird_system_service(proc: ProcessInfo) -> Tuple[int, List[str]]:
+    """
+    Detect if a process is a 'weird' system service - one that's legitimate but
+    exposes attack surface or behaves in ways that warrant attention.
+
+    This applies even to OFFICIAL/verified processes because provenance != safety.
+    A service can be legitimately installed but still be a security concern.
+
+    Returns: (score_to_add, list_of_evidence)
+    """
+    score = 0
+    evidence = []
+    policy = load_policy()
+    scores = policy["scores"]
+    if not _network_probe_enabled and not policy["toggles"].get("network_exposed_service"):
+        return 0, []
+
+    # Skip kernel threads - they're internal to the kernel
+    if proc.trust_level == TrustLevel.KERNEL:
+        return 0, []
+
+    # Check for network-listening services
+    # Get connections including listening sockets
+    connections = get_process_connections(proc.pid, include_listen=True)
+
+    listening_ports = []
+    external_listeners = []
+
+    for conn in connections:
+        if conn.state == "LISTEN":
+            listening_ports.append(conn.local_port)
+            # Check if listening on external interface (0.0.0.0 or ::)
+            if conn.local_address in ["0.0.0.0", "::", "*", ""]:
+                external_listeners.append(conn.local_port)
+
+    if external_listeners:
+        # Listening on all interfaces - externally accessible
+        score += scores.get("network_exposed_service", 20)
+        ports_str = ", ".join(str(p) for p in sorted(set(external_listeners))[:5])
+        if len(external_listeners) > 5:
+            ports_str += f" (+{len(external_listeners) - 5} more)"
+        evidence.append(f"Network-exposed service: listening on external interface(s) port(s) {ports_str} (+{scores.get('network_exposed_service', 20)})")
+        evidence.append("  Note: This service accepts connections from the network")
+    elif listening_ports:
+        # Listening but only on localhost - less concerning but still note it
+        ports_str = ", ".join(str(p) for p in sorted(set(listening_ports))[:5])
+        evidence.append(f"Local service: listening on localhost port(s) {ports_str} (no score added)")
+
+    # Check for services running as special system users (not root, not regular user)
+    # These often have specific privileges and access
+    if proc.uid > 0 and proc.uid < 1000:
+        # System user (typically 1-999 are system accounts)
+        # Check if this is a network-facing service
+        if external_listeners:
+            evidence.append(f"Running as system user '{proc.username}' (UID {proc.uid}) with network exposure")
+
+    # Store connections for later display
+    if connections:
+        proc.connections = connections
+
+    return score, evidence
+
+
+def calculate_weirdness_score(proc: ProcessInfo, user_trusted: Set[str]) -> int:
+    """Calculate weirdness score for a process."""
+    score = 0
+    policy = load_policy()
+    scores = policy["scores"]
+    toggles = policy["toggles"]
+
+    # Check user trusted
+    if proc.name in user_trusted or proc.path in user_trusted:
+        proc.trust_level = TrustLevel.USER_TRUSTED
+        proc.evidence.append("User trusted (suppresses non-critical scoring)")
+
+    # === HIGH SEVERITY: Deleted executable (still running but file removed) ===
+    # This is a very common malware technique
+    if proc.is_deleted:
+        score += scores["deleted_exe"]
+        proc.evidence.append(f"CRITICAL: Executable deleted from disk but still running (+{scores['deleted_exe']})")
+
+    # === HIGH SEVERITY: memfd/anonymous execution ===
+    # Running code directly from memory without a file on disk
+    if proc.is_memfd:
+        score += scores["memfd_exec"]
+        proc.evidence.append(f"CRITICAL: Executing from memory (memfd/anonymous) (+{scores['memfd_exec']})")
+        for ev in proc.memfd_evidence:
+            proc.evidence.append(f"  - {ev}")
+
+    # === WEIRD SYSTEM SERVICE DETECTION ===
+    # Even verified/official processes can be "weird" if they expose attack surface
+    # This checks for network-listening services, privileged daemons, etc.
+    weird_service_score, weird_evidence = detect_weird_system_service(proc)
+    if weird_service_score > 0:
+        score += weird_service_score
+        for ev in weird_evidence:
+            proc.evidence.append(ev)
+
+    # Fully trusted processes don't get scored beyond critical flags and weird service detection
+    if proc.trust_level in [
+        TrustLevel.OFFICIAL_REPO,
+        TrustLevel.FLATPAK,
+        TrustLevel.SNAP,
+        TrustLevel.CONTAINER,
+        TrustLevel.KERNEL,
+        TrustLevel.USER_TRUSTED,
+    ]:
+        if toggles.get("official_suspicious_parent"):
+            parent_fp = get_parent_chain_fingerprint(proc.pid)
+            def parent_is_suspicious(part: str) -> bool:
+                path = part.split(":", 1)[-1]
+                return is_suspicious_path(path) or is_user_local(path)
+
+            if any(parent_is_suspicious(p) for p in parent_fp.split(" <- ")):
+                score += scores["official_suspicious_parent"]
+                proc.evidence.append(f"Suspicious parent chain (+{scores['official_suspicious_parent']})")
+        if toggles.get("official_network_scoring"):
+            if not proc.connections:
+                proc.connections = get_process_connections(proc.pid)
+            if proc.connections:
+                score += scores["many_connections"]
+                proc.evidence.append(f"Official process with network activity (+{scores['many_connections']})")
+        return score
+
+    # THIRD_PARTY_REPO: allow limited scoring for suspicious behaviors
+    # (third-party repos are common attack vector)
+    is_third_party = proc.trust_level == TrustLevel.THIRD_PARTY_REPO
+
+    # === MEDIUM SEVERITY: ELF anomalies (only for non-third-party) ===
+    if not is_third_party and proc.path:
+        elf_suspicious, elf_reason = check_elf_sanity(proc.path)
+        if elf_suspicious:
+            score += scores["elf_suspicious"]
+            proc.evidence.append(f"Suspicious ELF: {elf_reason} (+{scores['elf_suspicious']})")
+
+    # Skip remaining checks for third-party if no high-severity issues found
+    if is_third_party and score == 0:
+        return 0
+
+    # Random-looking name
+    if is_random_looking_name(proc.name):
+        score += scores["random_name"]
+        proc.evidence.append(f"Random-looking name (+{scores['random_name']})")
+
+    # Suspicious path
+    if proc.path and is_suspicious_path(proc.path):
+        score += scores["suspicious_path"]
+        proc.evidence.append(f"Suspicious path (+{scores['suspicious_path']})")
+
+    # Bare interpreter
+    if is_bare_interpreter(proc):
+        score += scores["bare_interpreter"]
+        proc.evidence.append(f"Bare interpreter (+{scores['bare_interpreter']})")
+
+    # High memory for unknown process (threshold raised to reduce false positives
+    # from legitimate high-memory apps like scientific computing, ML, media processing)
+    if proc.trust_level == TrustLevel.UNKNOWN and proc.memory_mb > 1000:
+        score += scores["high_memory_unknown"]
+        proc.evidence.append(f"High memory ({proc.memory_mb:.0f}MB) for unknown process (+{scores['high_memory_unknown']})")
+
+    # Network activity scoring for suspicious processes
+    if proc.trust_level in [TrustLevel.UNKNOWN, TrustLevel.USER_LOCAL, TrustLevel.APPIMAGE, TrustLevel.UNTRACKED_KEY]:
+        if _network_probe_enabled:
+            if not proc.connections:
+                proc.connections = get_process_connections(proc.pid, include_listen=False)
+
+            if len(proc.connections) > 10:
+                score += scores["many_connections"]
+                proc.evidence.append(f"Many connections ({len(proc.connections)}) (+{scores['many_connections']})")
+
+            # Check for raw IP connections (not to known DoH/DoT)
+            raw_ip_count = 0
+            policy_net = policy["net"]
+            for conn in proc.connections:
+                remote_addr = conn.remote_address
+                if remote_addr in DOH_DOT_ENDPOINTS:
+                    continue
+                if not is_ip_literal(remote_addr):
+                    continue
+                if policy_net.get("allow_loopback") and is_loopback_ip(remote_addr):
+                    continue
+                if policy_net.get("allow_private") and is_private_ip(remote_addr):
+                    continue
+                if policy_net.get("allow_link_local") and is_link_local_ip(remote_addr):
+                    continue
+                if policy_net.get("allowed_networks") and in_allowed_networks(remote_addr, policy_net["allowed_networks"]):
+                    continue
+                raw_ip_count += 1
+
+            if raw_ip_count > 0:
+                add = min(scores["raw_ip_max"], raw_ip_count * scores["raw_ip_per"])
+                score += add
+                proc.evidence.append(f"Raw IP connections ({raw_ip_count}) (+{add})")
+
+            if toggles.get("unusual_port"):
+                common_ports = set(policy_net.get("common_ports", []))
+                unusual = [c.remote_port for c in proc.connections if c.remote_port and c.remote_port not in common_ports]
+                if unusual:
+                    score += scores["unusual_port"]
+                    proc.evidence.append(f"Unusual remote ports ({len(unusual)}) (+{scores['unusual_port']})")
+
+    return score
+
+
+# =============================================================================
+# Output Formatting
+# =============================================================================
+
+def get_weirdness_label(score: int) -> str:
+    """Return a graduated weirdness suffix based on score."""
+    if score <= 0:
+        return ""
+    if score <= 19:
+        return " (A little weird)"
+    if score <= 39:
+        return " (Weird)"
+    if score <= 59:
+        return " (Very weird)"
+    return " (CRITICAL WEIRDNESS)"
+
+
+def get_trust_display(proc: "ProcessInfo") -> str:
+    """
+    Get the display string for a process's trust level.
+    Appends '(Maybe Weird)' for official/trusted processes that have concerning behaviors.
+    Adds graduated weirdness labels for untrusted classes.
+    """
+    base = proc.trust_level.value
+
+    weirdness_levels = {
+        TrustLevel.UNKNOWN,
+        TrustLevel.UNTRACKED_KEY,
+        TrustLevel.USER_LOCAL,
+        TrustLevel.APPIMAGE,
+    }
+
+    if proc.trust_level in weirdness_levels:
+        return f"{base}{get_weirdness_label(proc.weirdness_score)}"
+
+    # Check if this is a trusted process with weird behaviors
+    trusted_levels = {
+        TrustLevel.OFFICIAL_REPO,
+        TrustLevel.THIRD_PARTY_REPO,
+        TrustLevel.FLATPAK,
+        TrustLevel.SNAP,
+        TrustLevel.USER_TRUSTED,
+    }
+
+    if proc.trust_level in trusted_levels and proc.weirdness_score > 0:
+        return f"{base} (Maybe Weird)"
+
+    return base
+
+
+def get_trust_color(trust_level: TrustLevel, weirdness_score: int = 0) -> str:
+    """Get ANSI color code for trust level. Yellow if trusted but weird."""
+    weirdness_levels = {
+        TrustLevel.UNKNOWN,
+        TrustLevel.UNTRACKED_KEY,
+        TrustLevel.USER_LOCAL,
+        TrustLevel.APPIMAGE,
+    }
+
+    if trust_level in weirdness_levels:
+        if weirdness_score <= 0:
+            return "\033[32m"  # Green
+        if weirdness_score <= 19:
+            return "\033[33m"  # Yellow
+        if weirdness_score <= 39:
+            return "\033[35m"  # Magenta
+        if weirdness_score <= 59:
+            return "\033[31m"  # Red
+        return "\033[1;31m"   # Bold Red
+
+    # If it's a trusted level but has weirdness, show yellow instead of green
+    trusted_but_weird = weirdness_score > 0 and trust_level in {
+        TrustLevel.OFFICIAL_REPO,
+        TrustLevel.THIRD_PARTY_REPO,
+        TrustLevel.USER_TRUSTED,
+    }
+
+    if trusted_but_weird:
+        return "\033[33m"  # Yellow for "trusted but weird"
+
+    colors = {
+        TrustLevel.OFFICIAL_REPO: "\033[32m",     # Green
+        TrustLevel.THIRD_PARTY_REPO: "\033[33m",  # Yellow
+        TrustLevel.FLATPAK: "\033[36m",           # Cyan
+        TrustLevel.SNAP: "\033[36m",              # Cyan
+        TrustLevel.CONTAINER: "\033[34m",         # Blue
+        TrustLevel.KERNEL: "\033[34m",            # Blue
+        TrustLevel.USER_TRUSTED: "\033[32m",      # Green
+        TrustLevel.USER_LOCAL: "\033[33m",        # Yellow
+        TrustLevel.APPIMAGE: "\033[33m",          # Yellow
+        TrustLevel.UNTRACKED_KEY: "\033[31m",     # Red
+        TrustLevel.UNKNOWN: "\033[31m",           # Red
+    }
+    return colors.get(trust_level, "\033[0m")
+
+
+def format_process_table(processes: List[ProcessInfo], verbose: bool = False) -> str:
+    """Format processes as a table."""
+    reset = "\033[0m"
+    bold = "\033[1m"
+
+    def truncate(text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if len(text) <= width:
+            return text
+        if width <= 3:
+            return text[:width]
+        return text[:width - 3] + "..."
+
+    pid_w = max(len("PID"), max((len(str(p.pid)) for p in processes), default=0))
+    score_w = max(
+        len("SCORE"),
+        max((len(f"{p.weirdness_score}/100") if p.weirdness_score > 0 else 1 for p in processes), default=1),
+    )
+    trust_w = 45
+    name_w = 18
+    table_width = pid_w + 2 + score_w + 2 + trust_w + 2 + name_w + 2 + len("DESCRIPTION")
+
+    lines = []
+    lines.append(
+        f"{bold}{'PID':>{pid_w}}  {'SCORE':>{score_w}}  "
+        f"{'TRUST LEVEL':<{trust_w}}  {'NAME':<{name_w}}  DESCRIPTION{reset}"
+    )
+    lines.append("-" * table_width)
+
+    for proc in processes:
+        color = get_trust_color(proc.trust_level, proc.weirdness_score)
+        trust_display = truncate(get_trust_display(proc), trust_w)
+        score_str = f"{proc.weirdness_score}/100" if proc.weirdness_score > 0 else "-"
+
+        # Get description - use cached if available, otherwise do a quick lookup
+        desc = proc.cached_description
+        if not desc:
+            # Quick local lookup only (man page) to avoid slowing down table
+            desc = get_man_page_description(proc.name) or ""
+            if desc:
+                proc.cached_description = desc
+
+        # Truncate description for table display
+        if desc:
+            desc_display = desc[:50] + "..." if len(desc) > 53 else desc
+        else:
+            desc_display = "Likely Malware" if proc.trust_level == TrustLevel.UNKNOWN else "(no description)"
+
+        lines.append(
+            f"{proc.pid:>{pid_w}}  {score_str:>{score_w}}  "
+            f"{color}{trust_display:<{trust_w}}{reset}  "
+            f"{truncate(proc.name, name_w):<{name_w}}  {desc_display}"
+        )
+
+    return "\n".join(lines)
+
+
+def format_process_detail(proc: ProcessInfo) -> str:
+    """Format detailed view of a process."""
+    reset = "\033[0m"
+    bold = "\033[1m"
+    red = "\033[31m"
+    color = get_trust_color(proc.trust_level, proc.weirdness_score)
+    trust_display = get_trust_display(proc)
+
+    lines = []
+    lines.append(f"\n{bold}{color}Process Details: {proc.name} (PID {proc.pid}){reset}")
+    lines.append("=" * 60)
+
+    # Show critical warnings first
+    if proc.is_deleted:
+        lines.append(f"\n{color}{bold}WARNING: EXECUTABLE DELETED FROM DISK{reset}")
+    if proc.is_memfd:
+        lines.append(f"\n{color}{bold}WARNING: EXECUTING FROM MEMORY (memfd/anonymous){reset}")
+
+    lines.append(f"\n{bold}Trust Level:{reset} {color}{trust_display}{reset}")
+
+    # Trust level explanation
+    # Trust level explanations with security caveats
+    # WARNING: Trust levels indicate provenance, NOT security guarantees
+    explanations = {
+        TrustLevel.OFFICIAL_REPO: "From signed distro repo - CAVEAT: Supply chain attacks possible (e.g., xz backdoor). Provenance verified, not vulnerability-free.",
+        TrustLevel.THIRD_PARTY_REPO: "From APT but signed by non-distro key (PPA, etc.) - Higher risk than official repos",
+        TrustLevel.UNTRACKED_KEY: "Key trusted by apt but origin unknown - INVESTIGATE: How was this key added?",
+        TrustLevel.FLATPAK: "Flatpak application (sandbox enforced) - Check flatpak permissions",
+        TrustLevel.SNAP: "Snap application - Confinement may be 'classic' (no sandbox). Verify with: snap info <app>",
+        TrustLevel.APPIMAGE: "AppImage - Portable app with NO sandboxing. User responsibility to verify.",
+        TrustLevel.USER_LOCAL: "User-installed binary (not from package manager) - Verify source manually",
+        TrustLevel.CONTAINER: "Running in container namespace - May have different security context",
+        TrustLevel.KERNEL: "Kernel thread (part of the Linux kernel)",
+        TrustLevel.USER_TRUSTED: "Explicitly trusted by user - Remove from trusted list if suspicious",
+        TrustLevel.UNKNOWN: "NO PROVENANCE FOUND - INVESTIGATE IMMEDIATELY. Unknown origin.",
+    }
+    lines.append(f"  Note: {explanations.get(proc.trust_level, '')}")
+
+    # For UNKNOWN processes, try to identify what they are
+    if proc.trust_level == TrustLevel.UNKNOWN:
+        proc_info = get_process_description(proc)
+        if proc_info:
+            cyan = "\033[36m"
+            source = proc_info.get("source", "unknown")
+            description = proc_info.get("description", "")
+
+            # Cache the description for use in the table
+            if description and description != "Unable to identify automatically":
+                proc.cached_description = description
+
+            lines.append(f"\n{bold}Process Identification ({source}):{reset}")
+
+            if source.startswith("package"):
+                lines.append(f"  {cyan}Package description:{reset}")
+                lines.append(f"  {proc_info.get('name', '')} - {description}")
+            elif source == "man page":
+                lines.append(f"  {cyan}Manual page says:{reset}")
+                lines.append(f"  {description}")
+            elif source in ["npm", "PyPI", "GitHub"]:
+                lines.append(f"  {cyan}Found in {source}:{reset}")
+                lines.append(f"  {proc_info.get('name', '')} - {description}")
+                if proc_info.get("url"):
+                    lines.append(f"  URL: {proc_info['url']}")
+                if proc_info.get("downloads"):
+                    lines.append(f"  Downloads: {proc_info['downloads']}")
+                if proc_info.get("stars"):
+                    lines.append(f"  {proc_info['stars']}")
+            elif source == "web search":
+                lines.append(f"  {cyan}Unable to identify automatically{reset}")
+                lines.append(f"  Search online: {proc_info.get('url', '')}")
+
+
+    lines.append(f"\n{bold}Basic Info:{reset}")
+    lines.append(f"  Binary: {proc.path or '(unknown)'}")
+    cmd_display = proc.cmdline[:100] + ("..." if len(proc.cmdline) > 100 else "")
+    lines.append(f"  Command: {cmd_display or '(unknown)'}")
+    lines.append(f"  User: {proc.username} (UID {proc.uid})")
+    lines.append(f"  Parent PID: {proc.ppid}")
+    lines.append(f"  Memory: {proc.memory_mb:.1f} MB")
+    if proc.process_key:
+        lines.append(f"  Process Key: {proc.process_key}")
+
+    if proc.package:
+        lines.append(f"  Package: {proc.package}")
+    if proc.provenance.manager:
+        lines.append(f"  Package Manager: {proc.provenance.manager}")
+        lines.append(f"  Ownership: {proc.provenance.ownership}")
+        lines.append(f"  Signature: {proc.provenance.signature}")
+
+    # Security flags
+    security_flags = []
+    if proc.is_deleted:
+        security_flags.append("deleted")
+    if proc.is_memfd:
+        security_flags.append("memfd/anon")
+    if security_flags:
+        lines.append(f"  {red}Security Flags: {', '.join(security_flags)}{reset}")
+
+    if proc.weirdness_score > 0:
+        lines.append(f"\n{bold}Weirdness Score:{reset} {proc.weirdness_score}/100")
+        for ev in proc.evidence:
+            lines.append(f"  - {ev}")
+
+    if proc.is_container:
+        lines.append(f"\n{bold}Container Evidence:{reset}")
+        for ev in proc.container_evidence:
+            lines.append(f"  - {ev}")
+
+    if proc.memfd_evidence:
+        lines.append(f"\n{bold}Memory Execution Evidence:{reset}")
+        for ev in proc.memfd_evidence:
+            lines.append(f"  - {ev}")
+
+    if proc.connections:
+        lines.append(f"\n{bold}Network Connections:{reset}")
+        sorted_conns = sorted(
+            proc.connections,
+            key=lambda c: (c.remote_address, c.remote_port, c.protocol)
+        )
+        for conn in sorted_conns[:10]:
+            direction = "outbound"
+            if conn.remote_address in ["", "0.0.0.0", "::", "*"]:
+                direction = "listen"
+            host = f" ({conn.hostname})" if conn.hostname else ""
+            lines.append(f"  - {conn.protocol} {conn.state} {direction}: {conn.remote_address}:{conn.remote_port}{host}")
+        if len(sorted_conns) > 10:
+            lines.append(f"  ... and {len(sorted_conns) - 10} more")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Baseline / Diff
+# =============================================================================
+
+def get_machine_id() -> str:
+    """Get machine-id if available."""
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"]:
+        try:
+            p = Path(path)
+            if p.exists():
+                return p.read_text().strip()
+        except (OSError, PermissionError):
+            continue
+    return ""
+
+
+def snapshot_process(proc: ProcessInfo) -> Dict[str, str]:
+    """Create a baseline snapshot entry for a process."""
+    exe_realpath = os.path.realpath(proc.path) if proc.path else ""
+    return {
+        "process_key": proc.process_key or build_process_key(proc),
+        "exe_realpath": exe_realpath,
+        "exe_sha256": hash_file(exe_realpath),
+        "uid": str(proc.uid),
+        "cmdline": sanitize_cmdline(normalize_cmdline(proc.cmdline)),
+        "package": proc.package or "",
+        "manager": proc.provenance.manager,
+        "ownership": proc.provenance.ownership,
+        "signature": proc.provenance.signature,
+        "trust_level": proc.trust_level.value,
+        "evidence": "; ".join(proc.evidence[:5]),
+    }
+
+
+def write_baseline(processes: List[ProcessInfo]) -> None:
+    """Write baseline to disk."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "machine_id": get_machine_id(),
+        "timestamp": int(time.time()),
+        "processes": [snapshot_process(p) for p in processes],
+    }
+    BASELINE_FILE.write_text(json.dumps(data, indent=2))
+
+
+def load_baseline() -> Optional[Dict]:
+    """Load baseline from disk."""
+    if not BASELINE_FILE.exists():
+        return None
+    try:
+        return json.loads(BASELINE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def diff_baseline(current: List[ProcessInfo], baseline: Dict) -> Dict[str, List[Dict]]:
+    """Compute diff between current processes and baseline."""
+    base_map = {p["process_key"]: p for p in baseline.get("processes", []) if p.get("process_key")}
+    cur_snap = [snapshot_process(p) for p in current]
+    cur_map = {p["process_key"]: p for p in cur_snap if p.get("process_key")}
+
+    new = [p for k, p in cur_map.items() if k not in base_map]
+    removed = [p for k, p in base_map.items() if k not in cur_map]
+    changed_hash = []
+    moved = []
+    trust_changed = []
+
+    for k, cur in cur_map.items():
+        base = base_map.get(k)
+        if not base:
+            continue
+        if base.get("exe_sha256") and cur.get("exe_sha256") and base["exe_sha256"] != cur["exe_sha256"]:
+            changed_hash.append(cur)
+        if base.get("exe_realpath") and cur.get("exe_realpath") and base["exe_realpath"] != cur["exe_realpath"]:
+            moved.append(cur)
+        if base.get("trust_level") and cur.get("trust_level") and base["trust_level"] != cur["trust_level"]:
+            trust_changed.append(cur)
+
+    return {
+        "new": new,
+        "removed": removed,
+        "changed_hash": changed_hash,
+        "moved": moved,
+        "trust_changed": trust_changed,
+    }
+
+
+# =============================================================================
+# Falco Integration
+# =============================================================================
+
+FALCO_RULES = """# weird - Custom Falco rules for process anomaly detection
+# Install to /etc/falco/rules.d/weird.yaml
+
+- rule: Process from untrusted location
+  desc: Process executed from suspicious path
+  condition: >
+    spawned_process and
+    (proc.exe startswith "/tmp/" or
+     proc.exe startswith "/dev/shm/" or
+     proc.exe startswith "/var/tmp/" or
+     proc.exe contains "/.cache/")
+  output: "Suspicious exec location (user=%user.name exe=%proc.exe cmdline=%proc.cmdline)"
+  priority: WARNING
+  tags: [weird, suspicious_path]
+
+- rule: Unknown binary with network connection
+  desc: Non-package binary making connections
+  condition: >
+    outbound and
+    not proc.exe pmatch (/usr/bin/*, /usr/sbin/*, /snap/*, /var/lib/flatpak/*, /usr/lib/*)
+  output: "Unknown binary networking (exe=%proc.exe dest=%fd.sip:%fd.sport cmdline=%proc.cmdline)"
+  priority: WARNING
+  tags: [weird, network]
+
+- rule: Interpreter with no script argument
+  desc: Bare interpreter process detected
+  condition: >
+    spawned_process and
+    (proc.name in (python, python3, ruby, perl, node, nodejs)) and
+    proc.cmdline = proc.name
+  output: "Bare interpreter (user=%user.name proc=%proc.name cmdline=%proc.cmdline)"
+  priority: NOTICE
+  tags: [weird, interpreter]
+
+- rule: Random-looking process name
+  desc: Process with potentially randomly-generated name
+  condition: >
+    spawned_process and
+    proc.name matches "^[a-f0-9]{12,}$"
+  output: "Random-looking process name (user=%user.name proc=%proc.name exe=%proc.exe)"
+  priority: WARNING
+  tags: [weird, random_name]
+"""
+
+
+def watch_falco():
+    """
+    Run Falco in foreground mode for real-time monitoring.
+    Falco runs as a session process and terminates when the terminal closes.
+    """
+    # Security: Use absolute paths for privileged execution to prevent PATH manipulation
+    FALCO_PATH = "/usr/bin/falco"
+    SUDO_PATH = "/usr/bin/sudo"
+
+    # Verify falco exists at expected location
+    if not os.path.isfile(FALCO_PATH):
+        # Check if it's installed elsewhere
+        falco_which = shutil.which("falco")
+        if falco_which:
+            print(f"Warning: Falco found at {falco_which} instead of {FALCO_PATH}")
+            print("For security, this tool requires Falco at /usr/bin/falco")
+            return 1
+        print("Error: Falco is not installed.")
+        print("\nTo install Falco:")
+        print("  curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | sudo gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg")
+        print("  echo 'deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main' | sudo tee /etc/apt/sources.list.d/falcosecurity.list")
+        print("  sudo apt update && sudo apt install falco")
+        return 1
+
+    # Verify sudo exists at expected location
+    if not os.path.isfile(SUDO_PATH):
+        print(f"Error: sudo not found at {SUDO_PATH}")
+        return 1
+
+    # Check for custom rules
+    rules_path = Path("/etc/falco/rules.d/weird.yaml")
+    if not rules_path.exists():
+        print("Note: Custom weird rules not installed.")
+        print(f"Install with: weird rules | sudo tee {rules_path}")
+        print()
+
+    print("Starting Falco in foreground mode (Ctrl+C to stop)...")
+    print("Falco will terminate when this terminal closes.")
+    print("-" * 60)
+
+    # Run Falco directly in foreground mode using absolute paths
+    # This prevents PATH manipulation attacks
+    try:
+        subprocess.run(
+            [SUDO_PATH, FALCO_PATH, "-o", "engine.kind=modern_ebpf"],
+            check=False  # Don't raise on Ctrl+C
+        )
+    except KeyboardInterrupt:
+        print("\nFalco stopped.")
+        return 0
+    except FileNotFoundError:
+        print("Error: Could not execute sudo or falco")
+        return 1
+
+    return 0
+
+
+# =============================================================================
+# CLI Commands
+# =============================================================================
+
+def cmd_scan(args) -> int:
+    """Main scan command."""
+    # Pipeline overview:
+    # 1. Build file->package cache and load the user-trusted list.
+    # 2. Collect /proc inventory, classify trust/provenance, and compute weirdness scores.
+    # 3. Populate cached descriptions via man pages or GitHub/npm lookups as needed.
+    # 4. Apply user rules (allow/suppress/upgrade/downgrade/tag).
+    # 5. Filter based on trust level, network flags, and --net/--verbose switches.
+    # 6. Sort by weirdness/trust, generate alerts, and emit JSON/NDJSON/baseline output.
+    # Security disclaimer (unless in JSON mode)
+    if not args.json and not args.ndjson:
+        print("\033[33m" + "=" * 70 + "\033[0m")
+        print("\033[33mSECURITY NOTE: Trust levels indicate PROVENANCE, not security.\033[0m")
+        print("\033[33mEven 'OFFICIAL' packages can be compromised (e.g., xz backdoor).\033[0m")
+        print("\033[33mThis tool is for defense-in-depth, not a complete security solution.\033[0m")
+        print("\033[33m" + "=" * 70 + "\033[0m\n")
+
+    global _network_probe_enabled
+    _network_probe_enabled = bool(args.net or args.include_listen or args.enrich_net)
+    debug_log("scan", f"start network_probe={_network_probe_enabled}")
+    # Build cache
+    file_package_cache.build()
+    debug_log("scan", "cache_built")
+
+    # Load user trusted list
+    user_trusted = load_user_trusted()
+    debug_log("scan", "user_trusted_loaded")
+
+    # Get all processes
+    if not args.json and not args.ndjson:
+        print("Scanning processes...")
+    processes = get_processes()
+    debug_log("scan", f"processes_collected count={len(processes)}")
+
+    # Classify each process
+    debug_log("scan", "classification_start")
+    for proc in processes:
+        trust_level, evidence = classify_process(proc)
+        proc.trust_level = trust_level
+        proc.evidence.extend(evidence)
+
+        # Get package name if available
+        if proc.provenance.package:
+            proc.package = proc.provenance.package
+        proc.process_key = build_process_key(proc)
+    debug_log("scan", "classification_done")
+
+    # Calculate weirdness scores
+    debug_log("scan", "scoring_start")
+    for proc in processes:
+        proc.weirdness_score = calculate_weirdness_score(proc, user_trusted)
+    debug_log("scan", "scoring_done")
+
+    # Apply rules/profiles
+    apply_rules(processes)
+
+    # Filter based on args
+    if not args.all:
+        # Filter out containers, flatpak, snap, kernel threads by default
+        processes = [p for p in processes if p.trust_level not in [
+            TrustLevel.CONTAINER, TrustLevel.FLATPAK, TrustLevel.SNAP, TrustLevel.KERNEL
+        ]]
+
+    if args.net:
+        for proc in processes:
+            if not proc.connections:
+                proc.connections = get_process_connections(
+                    proc.pid,
+                    include_listen=args.include_listen and not args.net_outbound_only
+                )
+        # Only show processes with network activity
+        processes = [p for p in processes if p.connections]
+        if args.enrich_net:
+            for proc in processes:
+                if proc.connections:
+                    enrich_connections(proc.connections)
+
+    # Sort by weirdness score (descending), then by trust level
+    trust_order = {
+        TrustLevel.UNKNOWN: 0,
+        TrustLevel.UNTRACKED_KEY: 1,
+        TrustLevel.APPIMAGE: 2,
+        TrustLevel.USER_LOCAL: 3,
+        TrustLevel.THIRD_PARTY_REPO: 4,
+        TrustLevel.FLATPAK: 5,
+        TrustLevel.SNAP: 5,
+        TrustLevel.CONTAINER: 6,
+        TrustLevel.KERNEL: 7,
+        TrustLevel.USER_TRUSTED: 8,
+        TrustLevel.OFFICIAL_REPO: 9,
+    }
+
+    processes.sort(key=lambda p: (
+        -p.weirdness_score,
+        trust_order.get(p.trust_level, 5),
+        p.process_key,
+        p.pid
+    ))
+
+    # Filter to suspicious only if not verbose
+    if not args.verbose:
+        # Show only processes with score > 0 or concerning trust levels
+        processes = [p for p in processes if
+            p.weirdness_score > 0 or
+            p.trust_level in [TrustLevel.UNKNOWN, TrustLevel.UNTRACKED_KEY]
+        ]
+
+    # Look up descriptions for display (man pages only - fast, local)
+    debug_log("scan", "man_desc_start")
+    man_cache: Dict[str, Optional[str]] = {}
+    for proc in processes:
+        if not proc.name:
+            continue
+        if proc.name not in man_cache:
+            man_cache[proc.name] = get_man_page_description(proc.name)
+        man_desc = man_cache.get(proc.name)
+        if man_desc:
+            proc.cached_description = man_desc
+    debug_log("scan", "man_desc_done")
+
+    # For processes without man pages, first check the file cache (fast, no network)
+    # This allows previously looked-up descriptions to be reused immediately
+    seen_names = set()
+    procs_needing_network_lookup = []
+    for proc in processes:
+        if not proc.cached_description and proc.name not in seen_names:
+            seen_names.add(proc.name)
+            # Check file cache first (no network call)
+            clean_name = proc.name.strip("()").split("/")[-1]
+            clean_name = re.sub(r'\.(py|sh|pl|rb)$', '', clean_name)
+            cached = get_desc_cache_entry(clean_name)
+            if cached and cached.get("description") and cached["description"] != "Unable to identify automatically":
+                # Apply cached description to all processes with this name
+                for p in processes:
+                    if p.name == proc.name:
+                        p.cached_description = cached["description"]
+            else:
+                procs_needing_network_lookup.append(proc)
+
+    # Do parallel GitHub lookups only for processes not in cache (limited to avoid slowdown)
+    MAX_GITHUB_LOOKUPS = 5
+    if procs_needing_network_lookup:
+        debug_log("scan", f"desc_lookup_start count={len(procs_needing_network_lookup[:MAX_GITHUB_LOOKUPS])}")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def lookup_desc(proc):
+            info = get_process_description(proc)
+            if info and info.get("description") and info["description"] != "Unable to identify automatically":
+                return (proc.name, info["description"])
+            return (proc.name, None)
+
+        with ThreadPoolExecutor(max_workers=MAX_GITHUB_LOOKUPS) as executor:
+            futures = {executor.submit(lookup_desc, p): p for p in procs_needing_network_lookup[:MAX_GITHUB_LOOKUPS]}
+            try:
+                for future in as_completed(futures, timeout=15):
+                    try:
+                        name, desc = future.result(timeout=3)
+                        if desc:
+                            for proc in processes:
+                                if proc.name == name:
+                                    proc.cached_description = desc
+                    except Exception:
+                        pass
+            except Exception:
+                pass  # Timeout or other error, continue with what we have
+        debug_log("scan", "desc_lookup_done")
+
+    # Baseline/diff mode
+    if getattr(args, "baseline_cmd", None):
+        if args.baseline_cmd == "init":
+            write_baseline(processes)
+            print(f"Baseline written to {BASELINE_FILE}")
+            return 0
+        if args.baseline_cmd == "show":
+            baseline = load_baseline()
+            if not baseline:
+                print("No baseline found. Run: weird baseline init")
+                return 1
+            print(json.dumps(baseline, indent=2))
+            return 0
+        if args.baseline_cmd == "diff":
+            baseline = load_baseline()
+            if not baseline:
+                print("No baseline found. Run: weird baseline init")
+                return 1
+            diff = diff_baseline(processes, baseline)
+            print("\nBaseline diff:\n")
+            for key in ["new", "changed_hash", "moved", "trust_changed"]:
+                if diff[key]:
+                    print(f"{key}: {len(diff[key])}")
+                    for item in diff[key][:10]:
+                        print(f"  - {item.get('process_key')}")
+            if not any(diff[k] for k in diff):
+                print("No differences found.")
+            return 0
+
+    # JSON/NDJSON output
+    # The payload includes host/timestamp metadata, alerts, and the process list.
+    # Each process dict exposes trust/provenance/description/weirdness_score so
+    # consumers such as btop or scripts can highlight the same fields.
+    alerts, exit_code = build_alerts(processes)
+    if _collector_errors:
+        exit_code = 3
+    if args.json:
+        payload = {
+            "host": socket.gethostname(),
+            "timestamp": int(time.time()),
+            "processes": [process_to_dict(p, raw_cmdline=args.raw_cmdline) for p in processes],
+            "alerts": alerts,
+            "errors": _collector_errors,
+        }
+        print(json.dumps(payload, indent=2))
+        if args.log_file:
+            log_event(args.log_file, f"json_output processes={len(processes)} alerts={len(alerts)}")
+        return exit_code
+
+    if args.ndjson:
+        host = socket.gethostname()
+        ts = int(time.time())
+        for p in processes:
+            item = process_to_dict(p, raw_cmdline=args.raw_cmdline)
+            item["host"] = host
+            item["timestamp"] = ts
+            print(json.dumps(item))
+        if args.log_file:
+            log_event(args.log_file, f"ndjson_output processes={len(processes)} alerts={len(alerts)}")
+        return exit_code
+
+    # Output
+    if not processes:
+        print("\nNo suspicious processes found.")
+        if args.log_file:
+            log_event(args.log_file, "scan no_suspicious_processes")
+        return exit_code
+
+    print(f"\nFound {len(processes)} process(es):\n")
+    print(format_process_table(processes, args.verbose))
+
+    # Show details for high-score OR unknown/suspicious trust level processes
+    policy = load_policy()
+    warn_threshold = policy["thresholds"]["warn"]
+    detailed_procs = [p for p in processes if
+        p.weirdness_score >= warn_threshold or
+        p.trust_level in [TrustLevel.UNKNOWN, TrustLevel.UNTRACKED_KEY]
+    ]
+    if detailed_procs and not args.verbose:
+        print(f"\n{len(detailed_procs)} process(es) requiring attention:")
+        for idx, proc in enumerate(detailed_procs[:10], 1):
+            print(f"\n[{idx}/{len(detailed_procs)}] PID {proc.pid}")
+            print(format_process_detail(proc))
+
+    if args.log_file:
+        log_event(args.log_file, f"scan processes={len(processes)} alerts={len(alerts)}")
+    return exit_code
+
+
+def cmd_inspect(args) -> int:
+    """Inspect a specific PID."""
+    pid = args.pid
+
+    # Build cache
+    file_package_cache.build()
+
+    # Get process info
+    processes = get_processes()
+    proc = next((p for p in processes if p.pid == pid), None)
+
+    if not proc:
+        print(f"Error: Process {pid} not found")
+        return 1
+
+    # Classify
+    user_trusted = load_user_trusted()
+    trust_level, evidence = classify_process(proc)
+    proc.trust_level = trust_level
+    proc.evidence.extend(evidence)
+
+    if proc.path:
+        proc.package = file_package_cache.get(proc.path) or ""
+
+    proc.weirdness_score = calculate_weirdness_score(proc, user_trusted)
+
+    # Get network connections
+    proc.connections = get_process_connections(pid)
+    if getattr(args, "enrich_net", False) and proc.connections:
+        enrich_connections(proc.connections)
+
+    # Print detailed view
+    proc.process_key = build_process_key(proc)
+    print(format_process_detail(proc))
+
+    # Additional inspection
+    print("\n\033[1mOpen Files:\033[0m")
+    try:
+        fd_dir = Path(f"/proc/{pid}/fd")
+        if fd_dir.exists():
+            count = 0
+            for fd in sorted(fd_dir.iterdir(), key=lambda x: int(x.name) if x.name.isdigit() else 0):
+                try:
+                    target = os.readlink(fd)
+                    if not target.startswith("/dev/") and not target.startswith("pipe:") and not target.startswith("socket:"):
+                        print(f"  {fd.name}: {target}")
+                        count += 1
+                        if count >= 20:
+                            print("  ... (truncated)")
+                            break
+                except (OSError, PermissionError):
+                    continue
+    except (IOError, PermissionError):
+        print("  (unable to read)")
+
+    # Process tree
+    print("\n\033[1mProcess Tree:\033[0m")
+    try:
+        result = subprocess.run(
+            ["pstree", "-p", "-s", str(pid)],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            print(f"  {result.stdout.strip()}")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print(f"  PID {pid} <- PPID {proc.ppid}")
+
+    return 0
+
+
+def cmd_trust(args) -> int:
+    """Add a process to user trusted list."""
+    name = args.name
+
+    # Ensure config dir exists
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Read existing trusted
+    trusted = load_user_trusted()
+
+    if name in trusted:
+        print(f"'{name}' is already in the trusted list")
+        return 0
+
+    # Add to file
+    with open(USER_TRUSTED_FILE, "a") as f:
+        f.write(f"\n{name}")
+
+    print(f"Added '{name}' to trusted list")
+    print(f"Edit {USER_TRUSTED_FILE} to modify trusted processes")
+    return 0
+
+
+def cmd_rules_init(args) -> int:
+    """Write rules template to rules.toml."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if RULES_FILE.exists() and not getattr(args, "force", False):
+        print(f"{RULES_FILE} already exists. Use --force to overwrite.")
+        return 1
+    template = """# weird rules.toml
+
+[profiles]
+
+[profiles.default]
+allow = []
+rules = []
+
+[[allow]]
+name = { equals = "bash" }
+
+[[rules]]
+name = { contains = "node" }
+cmdline = { regex = ".*~/(projects|Desktop)/.*" }
+action = "suppress"
+
+[[rules]]
+path = { contains = "/tmp/" }
+action = "upgrade"
+add = 20
+
+[[rules]]
+name = { regex = "^(chrome|chromium|firefox|firefox-esr)$" }
+cmdline = { regex = "--type=renderer|--type=utility|--contentproc" }
+action = "suppress"
+
+[[rules]]
+name = { regex = "^(apt|apt-get|dnf|yum|zypper|pacman|apk|xbps|eopkg|swupd|nix|nix-daemon)$" }
+uid = 0
+action = "suppress"
+
+[[rules]]
+name = { regex = "^(dbus-daemon|systemd|systemd-journald|systemd-logind|systemd-resolved|NetworkManager|gnome-keyring-daemon|gvfsd)$" }
+action = "suppress"
+"""
+    RULES_FILE.write_text(template)
+    print(f"Wrote rules template to {RULES_FILE}")
+    return 0
+
+
+def cmd_cache(args) -> int:
+    """Manage the file->package cache."""
+    if args.rebuild:
+        print("Rebuilding file->package cache...")
+        file_package_cache.build(force=True)
+        print(f"Cache rebuilt: {len(file_package_cache._cache)} files indexed")
+        print(f"Cache location: {CACHE_FILE}")
+    else:
+        if CACHE_FILE.exists():
+            file_package_cache.build()
+            print(f"Cache contains {len(file_package_cache._cache)} files")
+            print(f"Location: {CACHE_FILE}")
+            stat = CACHE_FILE.stat()
+            print(f"Size: {stat.st_size / 1024:.1f} KB")
+        else:
+            print("Cache not built yet. Run 'weird cache --rebuild'")
+
+    return 0
+
+
+def cmd_watch(args) -> int:
+    """Watch Falco alerts."""
+    return watch_falco()
+
+
+def cmd_rules(args) -> int:
+    """Output rules template."""
+    template = """# weird rules.toml
+
+[profiles]
+
+[profiles.default]
+allow = []
+rules = []
+
+[[allow]]
+name = { equals = "bash" }
+
+[[rules]]
+name = { contains = "node" }
+cmdline = { regex = ".*~/(projects|Desktop)/.*" }
+action = "suppress"
+
+[[rules]]
+path = { contains = "/tmp/" }
+action = "upgrade"
+add = 20
+
+[[rules]]
+name = { regex = "^(chrome|chromium|firefox|firefox-esr)$" }
+cmdline = { regex = "--type=renderer|--type=utility|--contentproc" }
+action = "suppress"
+
+[[rules]]
+name = { regex = "^(apt|apt-get|dnf|yum|zypper|pacman|apk|xbps|eopkg|swupd|nix|nix-daemon)$" }
+uid = 0
+action = "suppress"
+
+[[rules]]
+name = { regex = "^(dbus-daemon|systemd|systemd-journald|systemd-logind|systemd-resolved|NetworkManager|gnome-keyring-daemon|gvfsd)$" }
+action = "suppress"
+"""
+    print(template)
+    return 0
+
+
+def cmd_man(args) -> int:
+    """Show the manual page for weird."""
+    man_candidates = [
+        Path(__file__).resolve().parent / ".." / "man" / "weird.1",
+        Path("/usr/local/share/man/man1/weird.1"),
+        Path("/usr/share/man/man1/weird.1"),
+    ]
+    man_path = next((p for p in man_candidates if p.exists()), None)
+
+    if not man_path:
+        print("Man page not found. Expected under ../man/weird.1 or system man paths.")
+        return 1
+
+    man_bin = shutil.which("man")
+    if man_bin:
+        try:
+            subprocess.run([man_bin, "-l", str(man_path)], check=False)
+            return 0
+        except (FileNotFoundError, OSError):
+            pass
+
+    try:
+        print(man_path.read_text())
+    except (OSError, UnicodeDecodeError):
+        print(f"Man page found at {man_path} but could not be read.")
+        return 1
+    return 0
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Process Anomaly Detector - Identify suspicious processes",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+SECURITY WARNING:
+  Trust levels indicate PROVENANCE (where software came from), NOT security.
+  Even 'OFFICIAL' packages can contain vulnerabilities or be compromised
+  (e.g., xz backdoor, March 2024). Use this tool as part of defense-in-depth,
+  not as your only security control.
+
+Trust Levels:
+  OFFICIAL      Signed by system keyring - provenance verified, NOT vuln-free
+  THIRD_PARTY   From apt but signed by other key (PPA, etc.) - higher risk
+  FLATPAK       Flatpak application - check permissions
+  SNAP          Snap application - verify confinement level
+  APPIMAGE      Portable AppImage - NO sandboxing, user responsibility
+  USER_LOCAL    In ~/.local/bin or /usr/local - verify source manually
+  CONTAINER     Running in container namespace
+  KERNEL        Kernel thread (part of Linux kernel)
+  UNKNOWN       No provenance found - INVESTIGATE
+
+Examples:
+  weird                 Scan for suspicious processes
+  weird -v              Show all processes with classification
+  weird --net           Focus on processes with network activity
+  weird inspect 1234    Deep dive on PID 1234
+  weird trust myapp     Add 'myapp' to trusted list
+  weird watch           Monitor Falco alerts (requires Falco)
+  weird man             Show the manual page
+  weird --debug-log /tmp/weird.log   Enable debug logging
+        """
+    )
+
+    parser.add_argument("-v", "--verbose", action="store_true",
+                       help="Show all processes, not just suspicious ones")
+    parser.add_argument("-a", "--all", action="store_true",
+                       help="Include containers, Flatpak, and Snap (normally filtered)")
+    parser.add_argument("--net", action="store_true",
+                       help="Focus on processes with network activity")
+    parser.add_argument("--net-outbound-only", action="store_true",
+                       help="Only include outbound connections (default)")
+    parser.add_argument("--include-listen", action="store_true",
+                       help="Include listening sockets in network view")
+    parser.add_argument("--enrich-net", action="store_true",
+                       help="Enable network enrichment (best-effort)")
+    parser.add_argument("--json", action="store_true",
+                       help="Output JSON results")
+    parser.add_argument("--ndjson", action="store_true",
+                       help="Output newline-delimited JSON (one process per line)")
+    parser.add_argument("--log-file", dest="log_file",
+                       help="Append logs to a file (no secrets)")
+    parser.add_argument("--raw-cmdline", action="store_true",
+                       help="Include raw cmdline in JSON/NDJSON output (may contain secrets)")
+    parser.add_argument("--debug-log", dest="debug_log", metavar="FILE",
+                       help="Enable debug logging to FILE (for troubleshooting)")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # inspect subcommand
+    inspect_parser = subparsers.add_parser("inspect", help="Detailed inspection of a PID")
+    inspect_parser.add_argument("pid", type=int, help="Process ID to inspect")
+
+    # trust subcommand
+    trust_parser = subparsers.add_parser("trust", help="Add to user-trusted list")
+    trust_parser.add_argument("name", help="Process name or path to trust")
+
+    # rules subcommand
+    rules_parser = subparsers.add_parser("rules", help="Manage rules")
+    rules_sub = rules_parser.add_subparsers(dest="rules_cmd")
+    rules_sub.add_parser("show", help="Print rules template")
+    rules_init = rules_sub.add_parser("init", help="Write rules template to disk")
+    rules_init.add_argument("--force", action="store_true", help="Overwrite existing rules")
+
+    # cache subcommand
+    cache_parser = subparsers.add_parser("cache", help="Manage file->package cache")
+    cache_parser.add_argument("--rebuild", action="store_true",
+                             help="Force rebuild the cache")
+
+    # watch subcommand
+    subparsers.add_parser("watch", help="Watch Falco alerts in real-time")
+
+    # falco rules subcommand
+    subparsers.add_parser("falco-rules", help="Output Falco rules for integration")
+
+    # man subcommand
+    subparsers.add_parser("man", help="Show the manual page")
+
+    # baseline subcommand
+    baseline_parser = subparsers.add_parser("baseline", help="Baseline/diff mode")
+    baseline_parser.add_argument("baseline_cmd", choices=["init", "show", "diff"], help="Baseline action")
+
+    args = parser.parse_args()
+
+    # Set up debug logging if requested
+    global DEBUG_LOG_FILE
+    if getattr(args, 'debug_log', None):
+        DEBUG_LOG_FILE = Path(args.debug_log)
+        debug_log("startup", f"Debug logging enabled to {DEBUG_LOG_FILE}")
+
+    # Dispatch to command handler
+    if args.command == "inspect":
+        return cmd_inspect(args)
+    elif args.command == "trust":
+        return cmd_trust(args)
+    elif args.command == "cache":
+        return cmd_cache(args)
+    elif args.command == "watch":
+        return cmd_watch(args)
+    elif args.command == "rules":
+        if args.rules_cmd == "init":
+            return cmd_rules_init(args)
+        return cmd_rules(args)
+    elif args.command == "falco-rules":
+        print(FALCO_RULES)
+        return 0
+    elif args.command == "man":
+        return cmd_man(args)
+    elif args.command == "baseline":
+        return cmd_scan(args)
+    else:
+        return cmd_scan(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

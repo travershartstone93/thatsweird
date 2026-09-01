@@ -1,0 +1,296 @@
+.TH WEIRD 1 "January 22, 2026" "weird 1.0" "User Commands"
+.SH NAME
+weird \- process anomaly detector for Linux
+.SH SYNOPSIS
+.B weird
+[\fB\-v\fR] [\fB\-a\fR] [\fB\-\-net\fR] [\fB\-\-net\-outbound\-only\fR]
+[\fB\-\-include\-listen\fR] [\fB\-\-enrich\-net\fR]
+[\fB\-\-json\fR | \fB\-\-ndjson\fR]
+[\fB\-\-log\-file\fR \fIFILE\fR]
+[\fB\-\-raw\-cmdline\fR]
+[\fB\-\-debug\-log\fR \fIFILE\fR]
+.br
+.B weird
+\fBinspect\fR \fIPID\fR
+.br
+.B weird
+\fBtrust\fR \fINAME_OR_PATH\fR
+.br
+.B weird
+\fBrules\fR [\fBshow\fR | \fBinit\fR [\fB\-\-force\fR]]
+.br
+.B weird
+\fBcache\fR [\fB\-\-rebuild\fR]
+.br
+.B weird
+\fBbaseline\fR \fBinit\fR | \fBshow\fR | \fBdiff\fR
+.br
+.B weird
+\fBwatch\fR
+.br
+.B weird
+\fBfalco\-rules\fR
+.br
+.B weird
+\fBman\fR
+.SH DESCRIPTION
+.B weird
+scans running processes and highlights suspicious behavior and unclear provenance.
+It combines process inventory with package manager ownership, signature evidence,
+and behavioral signals to produce a weirdness score and trust label.
+The output is deterministic where possible (normalized cmdline, stable sorting)
+and can be emitted as JSON/NDJSON for automation.
+.SH ARCHITECTURE
+Data flow (best effort, never hard-fails):
+.TP
+.B Collectors
+Process inventory: osquery (preferred) or /proc fallback. Network inventory: ss (preferred) or /proc/net fallback.
+.TP
+.B Signals
+Deleted executable, memfd/anonymous exec, suspicious path, random name, bare interpreter, ELF sanity.
+.TP
+.B Provenance
+Package manager ownership + signature evidence (two-axis model).
+.TP
+.B Policy
+Scoring weights and thresholds from config.toml; toggles for higher-noise checks.
+.TP
+.B Rules
+rules.toml allows suppress/downgrade/upgrade/tag with profiles.
+.TP
+.B Output
+Table or JSON/NDJSON; optional baseline/diff.
+.TP
+.B Partial errors
+Collector failures are reported and return exit code 3 when applicable.
+.SH DETERMINISM
+Process keys are derived from realpath + uid + ppid + normalized cmdline.
+Cmdline whitespace is normalized across collectors, and output is sorted to reduce noise.
+Network connection lists are sorted in detail output for stability.
+.SH PROVENANCE MODEL
+Two-axis provenance:
+.TP
+.B Ownership
+Owned / unowned / unknown (package manager ownership only).
+.TP
+.B Signature
+official / third_party / unverified / unknown.
+.PP
+Trust levels are mapped conservatively. APT with official keyring match -> OFFICIAL.
+APT signed-by non-distro -> THIRD_PARTY. Other managers only elevate if verification is explicit.
+.SH SIGNATURE VERIFICATION
+.TP
+.B APT
+Uses InRelease + keyring fingerprints (strongest support).
+.TP
+.B RPM (DNF/YUM/Zypper)
+Uses rpmkeys/rpm --checksig when cached RPM is available; otherwise reports unavailable.
+.TP
+.B Pacman
+Reads SigLevel policy; per-package verification requires pkg+sig and is not performed.
+.TP
+.B APK
+Uses apk verify for integrity (does not claim signature verification).
+.TP
+.B XBPS / Portage / swupd
+Reports signed-repo/manifest evidence only (no per-package verification).
+.TP
+.B Nix
+Tries nix store verify --no-contents when available; otherwise integrity-only.
+.SH RULES
+rules.toml supports profiles and actions: suppress, downgrade, upgrade, tag.
+Run \fBweird rules init\fR to create a template.
+.SH BASELINE / DIFF
+Baseline stores process_key, exe realpath, sha256 (if readable), uid, cmdline (sanitized),
+package, trust level, provenance, and evidence snippet. Diff reports new, changed_hash,
+moved, and trust_changed.
+.SH NETWORK ENRICHMENT
+Network view uses outbound connections by default. Private/loopback/link-local addresses
+can be filtered. \fB--include-listen\fR adds listening sockets. \fB--enrich-net\fR enables
+best-effort reverse DNS and simple context hints.
+.SH SECURITY & PRIVACY
+Cmdline is sanitized by default in JSON/NDJSON and baseline outputs; use \fB--raw-cmdline\fR
+to include raw cmdline (may contain secrets). Subprocesses are time-bounded to avoid hangs.
+.SH HARDENING
+.TP
+.B Falco execution
+Uses absolute paths (/usr/bin/sudo, /usr/bin/falco) to prevent PATH manipulation.
+.TP
+.B Cache integrity
+Cache is written with 0600 permissions, ownership checks, and a checksum; atomic writes.
+.TP
+.B Symlink validation
+Symlink resolution is validated against allowed base directories to prevent escapes.
+.TP
+.B Debug logging
+Enable with \fB--debug-log FILE\fR or WEIRD_DEBUG_LOG to troubleshoot failures.
+.SH COMMANDS
+.TP
+.B (default)
+Scan for suspicious processes. Shows a table and (by default) detail for
+high\-score and unknown trust levels.
+.TP
+.B inspect \fIPID\fR
+Show a detailed inspection of a specific process, including open files and a
+process tree when available.
+.TP
+.B trust \fINAME_OR_PATH\fR
+Add a process name or path to the user trusted list.
+.TP
+.B rules show
+Print a rules template.
+.TP
+.B rules init
+Write the rules template to disk. Use \fB\-\-force\fR to overwrite.
+.TP
+.B cache
+Show cache status. Use \fB\-\-rebuild\fR to rebuild file\-\>package mapping.
+.TP
+.B baseline
+Baseline/diff mode. \fBinit\fR writes a baseline, \fBshow\fR prints it, \fBdiff\fR compares.
+.TP
+.B watch
+Run Falco in the foreground with weird rules (requires /usr/bin/falco and sudo).
+.TP
+.B falco\-rules
+Print Falco rules for integration.
+.TP
+.B man
+Show the manual page.
+.SH OPTIONS
+.TP
+.B \-v, \-\-verbose
+Show all processes, not just suspicious ones.
+.TP
+.B \-a, \-\-all
+Include containers, Flatpak, and Snap processes.
+.TP
+.B \-\-net
+Focus on processes with network activity.
+.TP
+.B \-\-net\-outbound\-only
+Only include outbound connections (default).
+.TP
+.B \-\-include\-listen
+Include listening sockets in network view.
+.TP
+.B \-\-enrich\-net
+Enable network enrichment (best effort).
+.TP
+.B \-\-json
+Output JSON.
+.TP
+.B \-\-ndjson
+Output newline\-delimited JSON (one process per line).
+.TP
+.B \-\-log\-file \fIFILE\fR
+Append logs to a file (no secrets).
+.TP
+.B \-\-raw\-cmdline
+Include raw cmdline in JSON/NDJSON output (may contain secrets).
+.TP
+.B \-\-debug\-log \fIFILE\fR
+Enable debug logging to FILE for troubleshooting.
+.SH OUTPUT
+The table shows PID, weirdness score, trust level, process name, and a short
+description. If no description is found for an UNKNOWN process, the table
+shows "Likely Malware".
+.SH TRUST LEVELS
+Trust levels indicate provenance, not security. Examples:
+.TP
+.B OFFICIAL
+Signed distro repository.
+.TP
+.B THIRD_PARTY
+From APT but signed by a non\-distro key.
+.TP
+.B UNTRACKED_KEY
+Key is trusted but origin is unclear.
+.TP
+.B USER_LOCAL
+User\-installed binary (e.g., /usr/local or ~/.local).
+.TP
+.B APPIMAGE
+Portable AppImage (no sandbox).
+.TP
+.B FLATPAK, SNAP, CONTAINER, KERNEL, USER_TRUSTED, UNKNOWN
+Other provenance classifications.
+.SH WEIRDNESS LABELS
+For UNKNOWN, UNTRACKED_KEY, USER_LOCAL, and APPIMAGE, weirdness labels are
+graduated by score:
+.TP
+.B 0
+UNKNOWN (green)
+.TP
+.B 1\-19
+UNKNOWN (A little weird) (yellow)
+.TP
+.B 20\-39
+UNKNOWN (Weird) (magenta)
+.TP
+.B 40\-59
+UNKNOWN (Very weird) (red)
+.TP
+.B 60+
+UNKNOWN (CRITICAL WEIRDNESS) (bold red)
+.PP
+Trusted processes with nonzero weirdness display "(Maybe Weird)".
+.SH FILES
+.TP
+.B ~/.config/weird/config.toml
+Policy configuration.
+.TP
+.B ~/.config/weird/rules.toml
+User rules.
+.TP
+.B ~/.config/weird/user_trusted.txt
+User trusted list.
+.TP
+.B ~/.config/weird/cache/file_package_map.json
+File\-\>package cache.
+.TP
+.B ~/.config/weird/desc_cache.json
+Description cache for man/registry lookups.
+.TP
+.B ~/.config/weird/baseline.json
+Baseline data.
+.SH EXIT STATUS
+.TP
+.B 0
+No alerts above threshold.
+.TP
+.B 1
+Warning.
+.TP
+.B 2
+Critical.
+.TP
+.B 3
+Internal error / partial failure.
+.SH SECURITY NOTES
+Trust indicates provenance only. Even OFFICIAL packages can be compromised.
+Use weird as part of defense\-in\-depth, not as your only security control.
+.SH EXAMPLES
+.TP
+weird
+Scan for suspicious processes.
+.TP
+weird \-v
+Show all processes.
+.TP
+weird \-\-net
+Focus on networked processes.
+.TP
+weird inspect 1234
+Inspect a specific PID.
+.TP
+weird rules init
+Create a rules file template.
+.TP
+weird man
+Show the manual page.
+.SH SEE ALSO
+.BR ps (1),
+.BR top (1),
+.BR ss (8),
+.BR lsof (8)

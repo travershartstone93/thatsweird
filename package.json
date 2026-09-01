@@ -1,0 +1,36 @@
+{
+  "name": "thatsweird",
+  "version": "1.0.4",
+  "description": "Process anomaly detector for Linux - identifies suspicious processes by analyzing provenance, behavior, and trust levels",
+  "bin": {
+    "weird": "./bin/weird"
+  },
+  "preferGlobal": true,
+  "files": [
+    "bin/weird",
+    "man/weird.1",
+    "README.md"
+  ],
+  "keywords": [
+    "security",
+    "process",
+    "monitor",
+    "anomaly",
+    "detection",
+    "linux",
+    "sysadmin",
+    "forensics"
+  ],
+  "os": [
+    "linux"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/travershartstone93/thatsweird.git"
+  },
+  "author": "Travers Hartstone",
+  "engines": {
+    "node": ">=14"
+  }
+}
