@@ -27,7 +27,8 @@ class CliTests(unittest.TestCase):
 
     def test_json_scan_has_expected_shape(self):
         r = run("--json")
-        self.assertEqual(r.returncode, 0, r.stderr[-500:])
+        # 0 = clean, 1 = warnings, 2 = suspicious processes found; 3 = collector failure
+        self.assertIn(r.returncode, (0, 1, 2), r.stderr[-500:])
         data = json.loads(r.stdout)
         self.assertIn("host", data)
         self.assertIn("timestamp", data)
