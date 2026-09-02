@@ -59,12 +59,12 @@ weird does **not** sniff packet contents. It builds a process‑to‑socket view
 
 ## Trust levels (provenance, not security)
 
-- **OFFICIAL** — Signed distro repository
-- **THIRD_PARTY** — APT package signed by a non‑distro key
-- **UNTRACKED_KEY** — Trusted key of unclear origin
-- **USER_LOCAL** — User‑installed binary (e.g., `/usr/local` or `~/.local`)
-- **APPIMAGE** — Portable app without sandboxing
-- **FLATPAK / SNAP / CONTAINER / KERNEL / USER_TRUSTED / UNKNOWN** — Other provenance classes
+- **OFFICIAL**: Signed distro repository
+- **THIRD_PARTY**: APT package signed by a non‑distro key
+- **UNTRACKED_KEY**: Trusted key of unclear origin
+- **USER_LOCAL**: User‑installed binary (e.g., `/usr/local` or `~/.local`)
+- **APPIMAGE**: Portable app without sandboxing
+- **FLATPAK / SNAP / CONTAINER / KERNEL / USER_TRUSTED / UNKNOWN**: Other provenance classes
 
 Even OFFICIAL packages can be compromised. Treat trust as provenance only.
 
@@ -72,11 +72,11 @@ Even OFFICIAL packages can be compromised. Treat trust as provenance only.
 
 For UNKNOWN / UNTRACKED_KEY / USER_LOCAL / APPIMAGE:
 
-- **0** — UNKNOWN (green)
-- **1–19** — UNKNOWN (A little weird)
-- **20–39** — UNKNOWN (Weird)
-- **40–59** — UNKNOWN (Very weird)
-- **60+** — UNKNOWN (CRITICAL WEIRDNESS)
+- **0**: UNKNOWN (green)
+- **1-19**: UNKNOWN (A little weird)
+- **20-39**: UNKNOWN (Weird)
+- **40-59**: UNKNOWN (Very weird)
+- **60+**: UNKNOWN (CRITICAL WEIRDNESS)
 
 Trusted processes that trip suspicious signals (e.g., unusual network activity,
 deleted binaries, memfd execution) display “(Maybe Weird)”.
@@ -112,11 +112,11 @@ weird man
 
 ## Files
 
-- `~/.config/weird/config.toml` — Policy configuration
-- `~/.config/weird/rules.toml` — User rules
-- `~/.config/weird/user_trusted.txt` — User trusted list
-- `~/.config/weird/cache/file_package_map.json` — File → package cache
-- `~/.config/weird/baseline.json` — Baseline data
+- `~/.config/weird/config.toml`: Policy configuration
+- `~/.config/weird/rules.toml`: User rules
+- `~/.config/weird/user_trusted.txt`: User trusted list
+- `~/.config/weird/cache/file_package_map.json`: File → package cache
+- `~/.config/weird/baseline.json`: Baseline data
 
 ## Help
 
