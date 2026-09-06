@@ -1,0 +1,12 @@
+# Scheduled weird persist run (systemd units, cron, autostart, shell rc, ld.so.preload,
+# udev, pacman hooks, makepkg.conf). Same install and path notes as weird.service.
+[Unit]
+Description=weird persistence entry check
+Documentation=https://github.com/travershartstone93/thatsweird
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env weird persist --json --journal --prometheus %h/.local/share/node_exporter/weird-persist.prom
+SuccessExitStatus=1 2
+SyslogIdentifier=weird-persist
+Nice=10

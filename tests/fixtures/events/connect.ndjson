@@ -1,0 +1,2 @@
+{"v":1,"ts":23389160318111,"kind":"hello","pid":296696,"tgid":296696,"ppid":296687,"uid":1000,"gid":1000,"comm":"weird-sensor","wall":1788494743,"boot":1788471354,"release":"7.2.2-1-cachyos","sensor":"0.1.0"}
+{"v":1,"ts":23389205000000,"kind":"connect","pid":4000129,"tgid":4000129,"ppid":100,"uid":1000,"gid":1000,"comm":"helper","family":2,"daddr":"203.0.113.7","dport":4444}

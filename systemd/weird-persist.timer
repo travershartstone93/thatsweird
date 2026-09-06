@@ -1,0 +1,11 @@
+# Daily trigger for weird-persist.service.
+[Unit]
+Description=Daily weird persistence entry check
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

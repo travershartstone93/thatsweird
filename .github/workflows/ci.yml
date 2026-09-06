@@ -1,12 +1,29 @@
 name: CI
 on: [push, pull_request]
 jobs:
-  test:
+  ubuntu:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: python -m py_compile bin/weird
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install .
+      - run: python -m py_compile bin/weird weird_cli/__init__.py scripts/update-pin.py
+      - run: weird --version
+      - run: weird self-check
+      - run: python -m unittest discover -s tests -v
+  archlinux:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm --needed python python-pip git
+      - uses: actions/checkout@v4
+      - run: python -m pip install --break-system-packages .
+      - run: python -m py_compile bin/weird weird_cli/__init__.py scripts/update-pin.py
+      - run: weird --version
+      - run: weird self-check
       - run: python -m unittest discover -s tests -v

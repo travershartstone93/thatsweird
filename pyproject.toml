@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "thatsweird"
+dynamic = ["version"]
+description = "Process anomaly detector for Linux: provenance, integrity and behaviour of what is running"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [{ name = "Travers Hartstone" }]
+keywords = ["security", "process", "anomaly", "detection", "linux", "forensics"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/travershartstone93/thatsweird"
+
+[project.scripts]
+weird = "weird_cli:main"
+
+# The version lives once, as __version__ in bin/weird; package.json must agree
+# (scripts/update-pin.py checks that).
+[tool.hatch.version]
+path = "bin/weird"
+
+[tool.hatch.build.targets.wheel]
+packages = ["weird_cli"]
+
+# The wheel gets copies of the script, its integrity pin and the man page next
+# to the shim, so a pip install runs the same bytes as bin/weird in a checkout.
+[tool.hatch.build.targets.wheel.force-include]
+"bin/weird" = "weird_cli/weird"
+"package.json" = "weird_cli/package.json"
+"man/weird.1" = "weird_cli/weird.1"
+
+[tool.hatch.build.targets.sdist]
+include = ["bin/weird", "weird_cli", "man", "scripts", "systemd", "docs", "package.json", "README.md", "CHANGELOG.md", "LICENSE"]

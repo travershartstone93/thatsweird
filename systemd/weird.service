@@ -1,0 +1,24 @@
+# Scheduled weird scan, written for the user instance (systemctl --user).
+# Install with either
+#   systemctl --user link "$PWD/systemd/weird.service" "$PWD/systemd/weird.timer"
+#   systemctl --user enable --now weird.timer
+# or copy both files into ~/.config/systemd/user/ and run the enable line.
+#
+# --prometheus writes a node_exporter textfile. %h is the home directory, so
+# start node_exporter with --collector.textfile.directory=$HOME/.local/share/node_exporter
+# and create that directory once. For the system instance (a copy in
+# /etc/systemd/system) drop %h and use the usual
+# /var/lib/node_exporter/textfile_collector/weird.prom instead.
+# Alerts go to the journal as SYSLOG_IDENTIFIER=weird (journalctl -t weird);
+# the JSON report on stdout is logged under weird-scan so it does not mix in.
+[Unit]
+Description=weird process anomaly scan
+Documentation=https://github.com/travershartstone93/thatsweird
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env weird --json --journal --prometheus %h/.local/share/node_exporter/weird.prom
+# Exit 1 (warnings) and 2 (critical) mean the scan ran and found things, not that the unit failed.
+SuccessExitStatus=1 2
+SyslogIdentifier=weird-scan
+Nice=10

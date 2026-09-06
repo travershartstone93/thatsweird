@@ -1,0 +1,2 @@
+{"v":1,"ts":23389160318111,"kind":"hello","pid":296696,"tgid":296696,"ppid":296687,"uid":1000,"gid":1000,"comm":"weird-sensor","wall":1788494743,"boot":1788471354,"release":"7.2.2-1-cachyos","sensor":"0.1.0"}
+{"v":1,"ts":23389202000000,"kind":"ptrace","pid":4000125,"tgid":4000125,"ppid":100,"uid":1000,"gid":1000,"comm":"python3","request":16,"target":4000126}

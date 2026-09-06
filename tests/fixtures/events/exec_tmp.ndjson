@@ -1,0 +1,2 @@
+{"v":1,"ts":23389160318111,"kind":"hello","pid":296696,"tgid":296696,"ppid":296687,"uid":1000,"gid":1000,"comm":"weird-sensor","wall":1788494743,"boot":1788471354,"release":"7.2.2-1-cachyos","sensor":"0.1.0"}
+{"v":1,"ts":23389190412000,"kind":"exec","pid":4000123,"tgid":4000123,"ppid":100,"uid":1000,"gid":1000,"comm":"sshd","path":"/tmp/sshd","argv0":"sshd","start":23389190400000}

@@ -1,0 +1,11 @@
+# Daily trigger for weird.service. Persistent=true runs a missed scan at the next boot.
+[Unit]
+Description=Daily weird process anomaly scan
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

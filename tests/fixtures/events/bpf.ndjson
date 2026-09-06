@@ -1,0 +1,2 @@
+{"v":1,"ts":23389160318111,"kind":"hello","pid":296696,"tgid":296696,"ppid":296687,"uid":1000,"gid":1000,"comm":"weird-sensor","wall":1788494743,"boot":1788471354,"release":"7.2.2-1-cachyos","sensor":"0.1.0"}
+{"v":1,"ts":23389204000000,"kind":"bpf","pid":4000128,"tgid":4000128,"ppid":100,"uid":1000,"gid":1000,"comm":"loader","cmd":5,"prog_type":2}

@@ -1,14 +1,19 @@
-.TH WEIRD 1 "January 22, 2026" "weird 1.0" "User Commands"
+.TH WEIRD 1 "September 6, 2026" "weird 1.1.0" "User Commands"
 .SH NAME
 weird \- process anomaly detector for Linux
 .SH SYNOPSIS
 .B weird
 [\fB\-v\fR] [\fB\-a\fR] [\fB\-\-net\fR] [\fB\-\-net\-outbound\-only\fR]
-[\fB\-\-include\-listen\fR] [\fB\-\-enrich\-net\fR]
+[\fB\-\-include\-listen\fR] [\fB\-\-enrich\-net\fR] [\fB\-\-deep\fR]
 [\fB\-\-json\fR | \fB\-\-ndjson\fR]
+[\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
 [\fB\-\-log\-file\fR \fIFILE\fR]
 [\fB\-\-raw\-cmdline\fR]
 [\fB\-\-debug\-log\fR \fIFILE\fR]
+[\fB\-\-proc\-root\fR \fIDIR\fR] [\fB\-\-sysroot\fR \fIDIR\fR]
+.br
+.B weird
+\fB\-\-version\fR
 .br
 .B weird
 \fBinspect\fR \fIPID\fR
@@ -17,22 +22,49 @@ weird \- process anomaly detector for Linux
 \fBtrust\fR \fINAME_OR_PATH\fR
 .br
 .B weird
-\fBrules\fR [\fBshow\fR | \fBinit\fR [\fB\-\-force\fR]]
+\fBrules\fR [\fBshow\fR [\fB\-\-defaults\fR] | \fBinit\fR [\fB\-\-force\fR]]
 .br
 .B weird
 \fBcache\fR [\fB\-\-rebuild\fR]
 .br
 .B weird
-\fBbaseline\fR \fBinit\fR | \fBshow\fR | \fBdiff\fR
+\fBbaseline\fR \fBinit\fR | \fBshow\fR | \fBdiff\fR | \fBtrust\fR \fIPID_OR_PATH\fR | \fBuntrust\fR \fIPATH\fR
 .br
 .B weird
-\fBwatch\fR
+\fBrestart\-needed\fR [\fB\-\-json\fR]
+.br
+.B weird
+\fBpersist\fR [\fB\-\-all\fR] [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
+.br
+.B weird
+\fBhidden\fR [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
+.br
+.B weird
+\fBkernel\fR [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
+.br
+.B weird
+\fBaur\fR [\fB\-\-all\fR] [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR] [\fB\-\-pkgbuild\-dir\fR \fIDIR\fR]
+.br
+.B weird
+\fBself\-check\fR [\fB\-\-json\fR]
+.br
+.B weird
+\fBoffline\fR \fISYSROOT\fR [\fB\-\-force\fR] [\fB\-\-limit\fR \fIN\fR] [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR] [\fB\-\-pkgbuild\-dir\fR \fIDIR\fR]
+.br
+.B weird
+\fBfixture record\fR \fIPID\fR \fIDIR\fR
+.br
+.B weird
+\fBwatch\fR [\fB\-\-poll\fR \fISECONDS\fR] [\fB\-\-events\fR \fIPATH\fR] [\fB\-\-follow\fR | \fB\-\-no\-follow\fR] [\fB\-\-falco\fR] [\fB\-\-journal\fR]
 .br
 .B weird
 \fBfalco\-rules\fR
 .br
 .B weird
 \fBman\fR
+.br
+.B weird
+\fBcompletions\fR \fBbash\fR | \fBfish\fR
 .SH DESCRIPTION
 .B weird
 scans running processes and highlights suspicious behavior and unclear provenance.
@@ -48,6 +80,9 @@ Process inventory: osquery (preferred) or /proc fallback. Network inventory: ss 
 .TP
 .B Signals
 Deleted executable, memfd/anonymous exec, suspicious path, random name, bare interpreter, ELF sanity.
+A deleted executable whose path is back on disk, owned by a package installed
+after the process started, is reported as stale after upgrade (low score) rather
+than critical.
 .TP
 .B Provenance
 Package manager ownership + signature evidence (two-axis model).
@@ -74,7 +109,8 @@ Two-axis provenance:
 Owned / unowned / unknown (package manager ownership only).
 .TP
 .B Signature
-official / third_party / unverified / unknown.
+official / third_party / verified / unverified / unknown. On pacman systems
+\fBverified\fR means the local database records a pgp check at install time.
 .PP
 Trust levels are mapped conservatively. APT with official keyring match -> OFFICIAL.
 APT signed-by non-distro -> THIRD_PARTY. Other managers only elevate if verification is explicit.
@@ -97,13 +133,58 @@ Reports signed-repo/manifest evidence only (no per-package verification).
 .TP
 .B Nix
 Tries nix store verify --no-contents when available; otherwise integrity-only.
+.SH BINARY INTEGRITY
+The running executable is hashed and compared with what the package
+recorded at install time: the sha256digest in the pacman mtree file
+(/var/lib/pacman/local/<pkg>/mtree), the md5 in the dpkg md5sums file
+(/var/lib/dpkg/info/<pkg>.md5sums, a weak hash but the only one dpkg keeps),
+or \fBrpm \-V\fR. The mtree and md5sums files are parsed in-process, so no
+root and no package manager call is needed.
+.PP
+By default only flagged processes are hashed (any score, deleted or memfd
+executable). \fB\-\-deep\fR adds every OFFICIAL and THIRD_PARTY process.
+\fBinspect\fR always verifies the inspected process and prints an
+Integrity line.
+.PP
+A mismatch adds the \fBintegrity_modified\fR signal (60 points, ATT&CK
+T1554) and the verdict becomes "Likely malicious" whatever the trust level.
+When the check cannot be made (no mtree, path not listed, unreadable file)
+the evidence says "unavailable" and nothing is scored. JSON output has the
+result in the \fBintegrity\fR field: intact, modified, unavailable or empty
+when the process was not checked.
 .SH RULES
 rules.toml supports profiles and actions: suppress, downgrade, upgrade, tag.
 Run \fBweird rules init\fR to create a template.
+.PP
+Matchers: \fBname\fR, \fBpath\fR and \fBcmdline\fR take an exact string or a table with
+\fBequals\fR, \fBcontains\fR or \fBregex\fR; \fBuid\fR, \fBmanager\fR, \fBpackage\fR and
+\fBtrust_level\fR are exact. \fBparent\fR matches when any ancestor comm matches (the ppid
+chain is walked up to 6 levels via /proc/PID/stat); \fBdirect_parent\fR matches the
+immediate parent only. A chain that ends early (ancestor exited, or unreadable) simply does
+not match. All matchers present in a rule must match.
+.PP
+Optional keys: \fBid\fR names the rule in the reasons list, \fBadd\fR sets the points for
+upgrade, \fBattack\fR records an ATT&CK technique id on upgrade, \fBtag\fR labels the row
+(on suppress as well as tag). Suppressed processes are hidden unless \fB\-v\fR is given.
+.PP
+Built-in rules run before rules.toml: builds under makepkg, paru, yay, pikaur or aurutils are
+suppressed and tagged "build"; a shell, interpreter, curl or wget whose ancestor is a browser,
+PDF viewer, office suite or mail client gains 30 points (T1204.002). Print them with
+\fBweird rules show \-\-defaults\fR; \fBdefaults = false\fR in rules.toml disables them.
 .SH BASELINE / DIFF
 Baseline stores process_key, exe realpath, sha256 (if readable), uid, cmdline (sanitized),
 package, trust level, provenance, and evidence snippet. Diff reports new, changed_hash,
 moved, and trust_changed.
+.PP
+\fBbaseline trust\fR \fIPID_OR_PATH\fR records the executable's realpath, sha256,
+package and trust level in ~/.config/weird/trusted.json (0600, written atomically,
+ignored when world\-writable or owned by another user). A process whose executable
+hash matches an entry is suppressed and tagged \fBtrusted\fR (shown with \fB\-v\fR).
+A process matching an entry by process key or path whose hash differs is not
+suppressed and gets \fBtrusted_binary_changed\fR (+30, T1554) with the date the
+trust was recorded. \fBbaseline diff\fR re\-hashes every trusted file on disk and
+lists changed ones under changed_hash whether or not they are running.
+\fBbaseline untrust\fR \fIPATH\fR removes the entry.
 .SH NETWORK ENRICHMENT
 Network view uses outbound connections by default. Private/loopback/link-local addresses
 can be filtered. \fB--include-listen\fR adds listening sockets. \fB--enrich-net\fR enables
@@ -138,7 +219,7 @@ process tree when available.
 Add a process name or path to the user trusted list.
 .TP
 .B rules show
-Print a rules template.
+Print a rules template. With \fB\-\-defaults\fR, print the built-in rules instead.
 .TP
 .B rules init
 Write the rules template to disk. Use \fB\-\-force\fR to overwrite.
@@ -147,17 +228,185 @@ Write the rules template to disk. Use \fB\-\-force\fR to overwrite.
 Show cache status. Use \fB\-\-rebuild\fR to rebuild file\-\>package mapping.
 .TP
 .B baseline
-Baseline/diff mode. \fBinit\fR writes a baseline, \fBshow\fR prints it, \fBdiff\fR compares.
+Baseline/diff mode. \fBinit\fR writes a baseline, \fBshow\fR prints it, \fBdiff\fR compares
+(and re\-hashes trusted files). \fBtrust\fR \fIPID_OR_PATH\fR records an executable hash
+in trusted.json so scans stay quiet until the file changes; \fBuntrust\fR \fIPATH\fR
+removes it. See BASELINE / DIFF.
+.TP
+.B restart\-needed
+List processes whose executable, or a library mapped in /proc/PID/maps, shows
+as (deleted) because a package installed after the process started replaced
+the file. Groups them by systemd unit (from /proc/PID/cgroup) and prints the
+matching \fBsystemctl restart\fR or \fBsystemctl \-\-user restart\fR line.
+needrestart is not in the official Arch repositories; this is the equivalent. \fB\-\-json\fR prints the
+same groups. Exit status is 1 when something is stale and 0 otherwise.
+.TP
+.B persist
+List persistence entries and the provenance of what each one launches.
+Sources: systemd units in /etc/systemd, /usr/lib/systemd and
+~/.config/systemd/user (ExecStart, ExecStartPre, ExecStartPost, ExecReload,
+timers followed to their service, drop\-ins), cron (/etc/crontab,
+/etc/cron.d, /etc/cron.{hourly,daily,weekly,monthly}, readable spool files,
+\fBcrontab \-l\fR), XDG autostart .desktop files, shell rc files (lines
+that run an absolute path or source a file no package owns), /etc/ld.so.preload,
+udev RUN rules in /etc/udev/rules.d, pacman hooks in /etc/pacman.d/hooks and
+/usr/share/libalpm/hooks, and CC, CXX, LD, STRIP, BUILDENV or PACKAGER in
+/etc/makepkg.conf and ~/.makepkg.conf pointing at a path no package owns.
+.IP
+Exec lines are read the way the launcher reads them: systemd prefixes (\-, @,
++, !), \fBenv VAR=x /path\fR, .desktop field codes and %h specifiers. A
+shell or interpreter given \-c is an inline script; an interpreter given a
+script path reports the script as the target.
+.IP
+Severity is \fBcritical\fR when the target is owned by no package, its hash
+differs from the package, or the entry lives under /tmp, /dev/shm or /var/tmp;
+\fBmedium\fR for inline scripts, USER_LOCAL or LOCAL_BUILD targets and shell
+rc hits; \fBinfo\fR otherwise. An inline script in a packaged unit or hook
+file that still matches its install hash is the distro's own and stays info.
+The table lists critical and medium entries and ends with a count line;
+\fB\-\-all\fR lists everything, \fB\-\-json\fR prints host, timestamp,
+entries (with the MITRE ATT&CK id per source) and counts. Exit status is 2
+with any critical entry, 1 with any medium one, 0 otherwise.
+.TP
+.B hidden
+Cross\-view checks for hidden processes, threads and sockets. Pids: the
+/proc directory listing against a direct stat of /proc/PID/stat for every pid
+from 1 to pid_max; a pid that answers but is not listed is \fBcritical\fR
+(T1564.001). Thread ids answer too, so a hit whose Tgid is another pid is a
+thread, and every hit is confirmed a second time so process churn is not
+reported. Sockets: inodes in /proc/net/{tcp,tcp6,udp,udp6} against
+\fBss \-tunapHe\fR (netlink); a socket only one side reports is
+\fBcritical\fR (T1014), /proc/net being read before and after ss. Threads:
+the Threads: line in status against the /proc/PID/task listing, re\-read to
+rule out a race (\fBmedium\fR). Totals: the task count in /proc/loadavg
+against the threads counted over the listing, with a margin (\fBlow\fR).
+Each row carries a one\-paragraph explanation. \fB\-\-json\fR prints host,
+timestamp, self_check, pid_max, listed_pids, hidden_pids, findings and counts.
+Exit status is 2 with any critical finding, 1 with any medium one, 0 otherwise.
+.IP
+\fBweird\fR, \fBweird hidden\fR and \fBweird persist\fR begin with a
+self\-check of their own process: a non\-empty /etc/ld.so.preload, LD_PRELOAD or
+LD_AUDIT in the environment, or an executable mapping in /proc/self/maps that
+no package owns (outside the interpreter's own prefix) prints a warning before
+any other output and is listed as self_check in JSON. The run continues.
+.TP
+.B kernel
+Loaded modules compared across /proc/modules, /sys/module (entries with a
+coresize or initstate file) and the [name] suffixes of /proc/kallsyms; a
+module absent from one view is \fBcritical\fR (T1014). Every loaded module
+must exist as a .ko, .ko.zst, .ko.xz or .ko.gz under /usr/lib/modules/RELEASE
+and be owned by a package, otherwise \fBcritical\fR "unowned module"; a module
+dkms built from a packaged source tree in /usr/src is info. A missing module
+directory for the running kernel while another kernel version is installed is
+"reboot pending" (info). /proc/sys/kernel/tainted is decoded: unsigned module
+(bit 13) is \fBmedium\fR, out\-of\-tree module (bit 12) low, or medium next to
+an unowned module, the rest info. With root and bpftool the loaded eBPF
+programs are counted and kprobes or tracepoints at getdents or the tcp/udp
+seq_show functions are noted. A posture block precedes the findings: Secure
+Boot (SecureBoot efivar), lockdown, modules_disabled, sig_enforce,
+kptr_restrict, unprivileged_bpf_disabled, yama ptrace_scope, LKRG (active when
+/sys/module/lkrg exists or lkrg is in /proc/modules, else not present), the
+real\-time sensor (active while /run/weird/events.ndjson was written in the
+last 120 seconds, else not running), taint, module counts and the verdict line
+"kernel module loading: open / signed only / disabled". Open module loading
+without LKRG adds an info finding recommending signed\-module enforcement or
+LKRG. \fB\-\-json\fR prints host, timestamp, modules, posture, findings
+and counts. Exit status is 2 with any critical finding, 1 with any medium one,
+0 otherwise.
+.TP
+.B self\-check
+Print the startup self\-check items and the self integrity result. At every
+start weird hashes its own script (sha256) and compares it with the
+weirdIntegrity pin in package.json next to bin/ (a pip install carries a copy of both
+beside the script); a mismatch prints one red
+warning on stderr before any output and sets self_integrity to "mismatch" in
+JSON payloads, without changing any exit status. A missing pin is reported as
+"integrity pin not found" with no warning. scripts/update\-pin.py records the
+current hash after an intended change.
+.TP
+.B offline \fISYSROOT\fR
+Live\-media mode. With the disk under investigation mounted at SYSROOT and its
+kernel not running, run the persistence sweep, the integrity of every
+package\-owned executable under SYSROOT/usr/bin and SYSROOT/usr/lib (pacman
+mtree or dpkg md5sums; a differing hash is \fBcritical\fR, T1554; symlinks and
+unowned files are counted, not hashed) and the AUR PKGBUILD checks when a
+pacman local database exists there, taking foreign packages from that database
+rather than from \fBpacman \-Qm\fR on the running system. No process scan.
+\fB\-\-limit\fR \fIN\fR hashes only the first N executables. \fB\-\-json\fR
+prints host, timestamp, sysroot, a section per part (persist, integrity, aur)
+and the combined findings and counts. SYSROOT "/" is refused without
+\fB\-\-force\fR (exit 3). Exit status is 2 with any critical finding, 1 with
+any medium one, 0 otherwise.
+.TP
+.B fixture record \fIPID\fR \fIDIR\fR
+Capture a live process into a tree that \fB\-\-proc\-root\fR DIR
+\fB\-\-sysroot\fR DIR/sysroot replays with the same trust level, score and
+reasons: the /proc files weird reads (stat, status, comm, cmdline, maps,
+environ, cgroup, exe link target, fd listing, the ancestors' stat and comm),
+/proc/stat and pid_max, the /proc/net lines for the process's sockets, a copy
+of the executable and the local database entries of the packages owning the
+executable and its mapped libraries. Environment values whose key contains
+KEY, TOKEN, SECRET, PASSWORD or API are replaced by "redacted".
+.TP
+.B aur
+Supply chain checks on the PKGBUILDs behind foreign packages (\fBpacman \-Qm\fR,
+or the local database when pacman is unavailable: validation other than pgp
+or an unknown packager). The PKGBUILD is looked up in ~/.cache/paru/clone/NAME,
+~/.cache/yay/NAME or \fB\-\-pkgbuild\-dir\fR DIR/NAME. source=() and its
+per\-arch variants are parsed (name::url entries, multi\-line arrays, $url style
+variables). A source fetched without https is \fBmedium\fR "insecure source",
+one on a paste host (pastebin, hastebin, ghostbin, transfer.sh, anonfiles)
+\fBcritical\fR. No checksum array or a SKIP for a plain download is \fBlow\fR;
+SKIP on a VCS source is info. install= is info (the script runs as root).
+When the clone is a git repository the last commit touching PKGBUILD is
+compared with %INSTALLDATE%: a newer commit is \fBmedium\fR "PKGBUILD modified
+after install" with the diff stat and the pkgver change, uncommitted edits
+likewise except a lone pkgver= bump; together with an insecure source in the
+same package it is \fBcritical\fR. Foreign packages that still carry a pgp
+signature or have no clone are info. \fB\-\-all\fR lists the info entries,
+\fB\-\-json\fR prints host, timestamp, packages, findings and counts. Exit
+status is 2 with any critical finding, 1 with any medium one, 0 otherwise.
 .TP
 .B watch
-Run Falco in the foreground with weird rules (requires /usr/bin/falco and sudo).
+Poll /proc every 2 seconds (\fB\-\-poll\fR \fISECONDS\fR) and score only processes
+not seen before, keyed by pid and start time so a reused pid counts as new. Each
+new process with a score above zero or a memfd/deleted executable is printed as one
+NDJSON line in the \fB\-\-ndjson\fR shape; clean processes are silent and no key is
+printed twice. Needs no root and no Falco. One line, "watching /proc every N s", goes
+to stderr at startup. Ctrl\-C exits 0. \fB\-\-falco\fR runs Falco in the foreground
+with the weird rules instead (requires /usr/bin/falco and sudo).
+.IP
+\fB\-\-events\fR \fIPATH\fR reads weird\-sensor NDJSON events (schema v1) from
+\fIPATH\fR instead of polling; without \fB\-\-poll\fR or \fB\-\-events\fR the file
+/run/weird/events.ndjson is used automatically while it was written in the last
+120 seconds. Each exec event is read from /proc at once and scored like a scan;
+a process gone before /proc could be read is printed only when its exec path was
+under /tmp, /dev/shm, /var/tmp or deleted ("short-lived process", T1036.005).
+memfd, ptrace and connect events add the memfd_exec, traced and raw_ip_outbound
+signals to that pid; module and bpf events print module_load (critical unless the
+.ko is owned) and bpf_load (info for a packaged loader, medium otherwise)
+findings with "kind", "detail", "severity" and "attack"; a lost event runs a full
+scan. The first line must be the sensor's hello; another schema version exits 3.
+Paths under /run are followed like tail \-F (rotation and truncation reopen the
+file), other paths are read to end of file; \fB\-\-follow\fR and
+\fB\-\-no\-follow\fR override that. \fB\-\-journal\fR sends alerts and findings to
+the systemd journal.
 .TP
 .B falco\-rules
 Print Falco rules for integration.
 .TP
 .B man
 Show the manual page.
+.TP
+.B completions bash | fish
+Print a completion script for the given shell, generated from the command tree
+so it always matches \fB\-\-help\fR. Install with
+\fBweird completions bash > ~/.local/share/bash\-completion/completions/weird\fR or
+\fBweird completions fish > ~/.config/fish/completions/weird.fish\fR.
 .SH OPTIONS
+.TP
+.B \-\-version
+Print the version and exit.
 .TP
 .B \-v, \-\-verbose
 Show all processes, not just suspicious ones.
@@ -177,11 +426,33 @@ Include listening sockets in network view.
 .B \-\-enrich\-net
 Enable network enrichment (best effort).
 .TP
+.B \-\-deep
+Hash every OFFICIAL and THIRD_PARTY executable against its package, not only
+the flagged ones. Costs well under a second per hundred binaries.
+.TP
 .B \-\-json
 Output JSON.
 .TP
 .B \-\-ndjson
 Output newline\-delimited JSON (one process per line).
+.TP
+.B \-\-journal
+Send each alert to the systemd journal: SYSLOG_IDENTIFIER=weird, PRIORITY 2 for
+critical and 4 for warning, MESSAGE "weird: VERDICT NAME pid PID score N: first
+reason", plus WEIRD_PID, WEIRD_NAME, WEIRD_SCORE, WEIRD_TRUST, WEIRD_ATTACK (comma
+separated) and WEIRD_VERDICT. On \fBpersist\fR, \fBhidden\fR, \fBkernel\fR and
+\fBaur\fR the non\-info findings are logged with WEIRD_KIND, WEIRD_COMMAND,
+WEIRD_SEVERITY and WEIRD_SUBJECT (medium is priority 4, low 5). Uses the
+systemd.journal module when installed, else the journald socket, else systemd\-cat,
+else logger(1). Read back with \fBjournalctl \-t weird\fR.
+.TP
+.B \-\-prometheus \fIPATH\fR
+Write a node_exporter textfile: weird_alerts{level="critical"|"warning"},
+weird_processes_total, weird_scan_timestamp_seconds and weird_scan_duration_seconds
+(the subcommands write weird_findings{command=...,severity=...}). Written to a
+temporary file in the same directory and renamed into place. The shipped
+systemd/weird.service and weird.timer run a daily scan with \fB\-\-journal\fR and
+\fB\-\-prometheus\fR.
 .TP
 .B \-\-log\-file \fIFILE\fR
 Append logs to a file (no secrets).
@@ -191,10 +462,22 @@ Include raw cmdline in JSON/NDJSON output (may contain secrets).
 .TP
 .B \-\-debug\-log \fIFILE\fR
 Enable debug logging to FILE for troubleshooting.
+.TP
+.B \-\-proc\-root \fIDIR\fR
+Read process information from DIR instead of /proc (a recorded fixture, or a
+copied /proc). Also read from WEIRD_PROC_ROOT.
+.TP
+.B \-\-sysroot \fIDIR\fR
+Prefix for package databases and system configuration (/var/lib/pacman,
+/var/lib/dpkg, /etc, /usr/lib/modules and so on). Also read from
+WEIRD_SYSROOT. \fBoffline\fR sets it from its SYSROOT argument.
 .SH OUTPUT
 The table shows PID, weirdness score, trust level, process name, and a short
-description. If no description is found for an UNKNOWN process, the table
-shows "Likely Malware".
+description. If no description is found the table shows the verdict:
+"Unverified" (no provenance, no signals), "Suspicious" (one signal, or any
+signals on a process with known provenance) or "Likely malicious" (two or
+more signals, or memfd, deleted or masquerade on an unverified process).
+Each scoring reason is printed under the row with its MITRE ATT&CK technique.
 .SH TRUST LEVELS
 Trust levels indicate provenance, not security. Examples:
 .TP
@@ -210,13 +493,22 @@ Key is trusted but origin is unclear.
 .B USER_LOCAL
 User\-installed binary (e.g., /usr/local or ~/.local).
 .TP
+.B USER_PKG
+Installed by a user space package manager (uv, pipx, npm, cargo, rustup, go,
+nvm, pip) according to its own metadata under the home directory; evidence
+reads "installed by <manager> as <name>@<version>". Go binaries are identified
+with \fBgo version \-m\fR. Nothing was signature checked.
+.TP
+.B LOCAL_BUILD
+Built locally via makepkg (AUR or manual build); no repository signature.
+.TP
 .B APPIMAGE
 Portable AppImage (no sandbox).
 .TP
 .B FLATPAK, SNAP, CONTAINER, KERNEL, USER_TRUSTED, UNKNOWN
 Other provenance classifications.
 .SH WEIRDNESS LABELS
-For UNKNOWN, UNTRACKED_KEY, USER_LOCAL, and APPIMAGE, weirdness labels are
+For UNKNOWN, UNTRACKED_KEY, USER_LOCAL, USER_PKG, LOCAL_BUILD, and APPIMAGE, weirdness labels are
 graduated by score:
 .TP
 .B 0
@@ -254,6 +546,12 @@ Description cache for man/registry lookups.
 .TP
 .B ~/.config/weird/baseline.json
 Baseline data.
+.TP
+.B ~/.config/weird/trusted.json
+Trusted executable hashes written by \fBweird baseline trust\fR (0600).
+.TP
+.B systemd/weird.service, weird.timer, weird\-persist.service, weird\-persist.timer
+Shipped user units for a daily scan and persistence check.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -286,6 +584,30 @@ Inspect a specific PID.
 .TP
 weird rules init
 Create a rules file template.
+.TP
+weird persist
+List what starts on its own and where it came from.
+.TP
+weird hidden
+Find pids, threads and sockets the normal listings do not show.
+.TP
+weird kernel
+Loaded module cross\-view, ownership, taint and hardening posture.
+.TP
+weird aur
+Check the PKGBUILDs behind locally built packages.
+.TP
+weird watch
+Print one NDJSON line per new flagged process, polling /proc every 2 seconds.
+.TP
+weird watch \-\-events /run/weird/events.ndjson
+Score every exec the eBPF sensor reports, as it happens.
+.TP
+weird \-\-journal \-\-prometheus /var/lib/node_exporter/textfile_collector/weird.prom
+Scan, log alerts to the journal and write node_exporter metrics.
+.TP
+weird baseline trust 1234
+Record the hash of the executable behind PID 1234; scans stay quiet until the file changes.
 .TP
 weird man
 Show the manual page.

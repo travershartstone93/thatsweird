@@ -1,129 +1,224 @@
 # thatsweird
 
-Process anomaly detector for Linux. It scans running processes, checks provenance, and scores suspicious behavior so you can focus on what actually looks risky.
+`weird` looks at every process on a Linux machine and answers two questions
+about each one: where did this executable come from, and is it doing anything
+a normal copy of that program would not do. Provenance comes from the package
+database (pacman or dpkg), the signature policy and the hash the package
+recorded at install time. Behaviour comes from /proc: memfd executables,
+deleted binaries, injected libraries, loader variables, odd parents, raw IP
+connections. The two combine into a score, a verdict and a list of reasons
+with MITRE ATT&CK ids, readable by a person or piped into the journal, a
+metrics file or a real-time consumer. It is one Python file with no
+dependencies outside the standard library, and it runs without root.
 
 ## Install
+
 ```bash
-sudo npm install -g thatsweird
+sudo npm install -g thatsweird                                   # npm
+pipx install git+https://github.com/travershartstone93/thatsweird.git   # pipx (or pipx install . in a checkout)
+git clone https://github.com/travershartstone93/thatsweird && python3 thatsweird/bin/weird   # from source
 ```
 
-## Requires
-Python 3.8+ on the target system.
+Python 3.8 or newer. Both packages run the same file, `bin/weird`; the pip
+package wraps it in a `weird_cli` shim so `pip install .` gives a `weird`
+console script. Shell completions are generated from the command tree:
+
+```bash
+weird completions bash > ~/.local/share/bash-completion/completions/weird
+weird completions fish > ~/.config/fish/completions/weird.fish
+```
 
 ## Quick start
+
 ```bash
-weird              # Scan for suspicious processes
+weird                # table of processes that need a look, reasons under each row
+weird -v             # every process with its trust level and score
+weird --json         # the same as JSON: processes, reasons, attack ids, verdicts, integrity
+weird inspect 1234   # one process in depth: provenance, integrity, mappings, environment, sockets, tree
 ```
 
-**Make sure terminal window is big enough to see full table**
-
-## Options
-
-weird -v           # Verbose output (show all processes)
-weird --net        # Show networked processes
-weird --json       # JSON output for scripting
-weird inspect 1234 # Deep dive on a PID
-weird man          # Manual page
-
-## What it does
-
-- Verifies process provenance (package manager ownership + signature evidence)
-- Detects suspicious behaviors (memfd execution, deleted binaries, odd paths, network exposure, etc.)
-- Computes a weirdness score so high‑risk items bubble up
-- Labels trust levels (OFFICIAL, UNKNOWN, USER_TRUSTED, etc.)
-- Tries to identify UNKNOWN processes via man pages and registry lookups
-
-## How descriptions are generated (flow + fallbacks)
-
-When a process is UNKNOWN, weird tries to add a human‑readable description using this chain:
-
-1) **Man page lookup (local, fast)**  
-   If a man page exists for the process name, the tool extracts the NAME or DESCRIPTION section.
-
-2) **Registry lookup (best effort, network)**  
-   If there is no man page result, it infers the ecosystem from the process path/parent/cmdline:
-   - Node → npm registry  
-   - Python → PyPI  
-   - Rust/Go/other → GitHub search  
-   This yields a package name, short description, and URL (when available).
-
-3) **Final fallback**  
-   If nothing can be identified, the table shows **“Likely Malware”** for UNKNOWN processes.
-
-### Network inspection (what it actually does)
-
-weird does **not** sniff packet contents. It builds a process‑to‑socket view using:
-
-- `ss` (preferred) or `/proc/net` as a fallback
-- Outbound connections by default
-
-## Trust levels (provenance, not security)
-
-- **OFFICIAL**: Signed distro repository
-- **THIRD_PARTY**: APT package signed by a non‑distro key
-- **UNTRACKED_KEY**: Trusted key of unclear origin
-- **USER_LOCAL**: User‑installed binary (e.g., `/usr/local` or `~/.local`)
-- **APPIMAGE**: Portable app without sandboxing
-- **FLATPAK / SNAP / CONTAINER / KERNEL / USER_TRUSTED / UNKNOWN**: Other provenance classes
-
-Even OFFICIAL packages can be compromised. Treat trust as provenance only.
-
-## Weirdness labels (untrusted classes)
-
-For UNKNOWN / UNTRACKED_KEY / USER_LOCAL / APPIMAGE:
-
-- **0**: UNKNOWN (green)
-- **1-19**: UNKNOWN (A little weird)
-- **20-39**: UNKNOWN (Weird)
-- **40-59**: UNKNOWN (Very weird)
-- **60+**: UNKNOWN (CRITICAL WEIRDNESS)
-
-Trusted processes that trip suspicious signals (e.g., unusual network activity,
-deleted binaries, memfd execution) display “(Maybe Weird)”.
-
-## Example output
-
-```
-    PID    SCORE  TRUST LEVEL                                 NAME                DESCRIPTION
---------------------------------------------------------------------------------------------------------------
-  12345   75/100  UNKNOWN (CRITICAL WEIRDNESS)                suspicious          Likely Malware
-   5432   20/100  USER_LOCAL (Weird)                          mytool              (no description)
-    847   10/100  OFFICIAL (Maybe Weird)                      avahi-daemon        avahi-daemon - The Avahi mDNS/DNS-SD daemon
-```
+Exit status is 2 when something looks malicious, 1 for warnings, 0 when
+clean, 3 when a collector failed. Make the terminal wide enough for the table.
 
 ## Commands
 
-```text
-weird [-v] [-a] [--net] [--net-outbound-only]
-      [--include-listen] [--enrich-net]
-      [--json | --ndjson]
-      [--log-file FILE]
-      [--raw-cmdline]
-      [--debug-log FILE]
-weird inspect PID
-weird trust NAME_OR_PATH
-weird rules [show | init [--force]]
-weird cache [--rebuild]
-weird baseline init | show | diff
-weird watch
-weird falco-rules
-weird man
+| Command | What it does |
+| --- | --- |
+| `weird` | Scan running processes; `-v` shows all, `--net` those with connections, `--deep` hashes every packaged binary |
+| `weird inspect PID` | Everything weird knows about one process |
+| `weird trust NAME` | Add a process name or path to the user trusted list |
+| `weird rules show \| init` | Print or write the rules.toml template; `show --defaults` prints the built-in rules |
+| `weird cache [--rebuild]` | Show or rebuild the file to package cache |
+| `weird baseline init \| show \| diff \| trust PID \| untrust PATH` | Record what runs, compare later; `trust` pins an executable's hash |
+| `weird watch` | One NDJSON line per new flagged process; `--events PATH` reads weird-sensor, `--falco` runs Falco |
+| `weird restart-needed` | Processes still running files an upgrade replaced, grouped by systemd unit |
+| `weird persist` | What starts without you: units, cron, autostart, shell rc, ld.so.preload, udev, pacman hooks |
+| `weird hidden` | Processes, threads and sockets that one view of the kernel shows and another does not |
+| `weird kernel` | Loaded modules across three views, module ownership, taint, hardening posture |
+| `weird aur` | PKGBUILD supply chain checks behind locally built packages |
+| `weird offline SYSROOT` | Persistence, executable integrity and aur against a mounted disk, from live media |
+| `weird self-check` | Own-process checks and the script's sha256 against its pin |
+| `weird fixture record PID DIR` | Capture a live process for replay with `--proc-root DIR --sysroot DIR/sysroot` |
+| `weird falco-rules` | Print the Falco rules weird ships |
+| `weird completions bash \| fish` | Print a completion script |
+| `weird man` | Show the manual page |
+
+`--journal` and `--prometheus PATH` work on the scan and on `persist`,
+`hidden`, `kernel`, `aur` and `offline`. `--proc-root` and `--sysroot`
+point every reader at a recorded tree instead of the live system. The man
+page (`man/weird.1`) documents every flag; [docs/reference.md](docs/reference.md)
+has the long form of each subcommand.
+
+## How it works
+
+**Provenance** is two axes. The first is who owns the file: the package
+database says which package installed this path (pacman's local database or
+dpkg's info lists, read in-process, no root), and metadata from uv, pipx,
+npm, cargo, rustup, go and nvm covers the tools those install. The second is
+whether that package can be believed: repository signing, the SigLevel in
+pacman.conf, and the hash the package recorded at install time (pacman mtree
+sha256, dpkg md5sums) compared with the file that is running. A packaged
+binary whose hash differs is `integrity_modified` (T1554) and the verdict is
+"Likely malicious" whatever the trust level.
+
+**Signals** are the behaviours read from /proc, each with a score and an
+ATT&CK id: masquerade, an unpackaged binary using a system daemon's name
+(T1036.005); suspicious path under /tmp, /dev/shm or /var/tmp (T1036.005);
+deleted executable (T1070.004); memfd execution (T1620); LD_PRELOAD,
+LD_AUDIT or LD_LIBRARY_PATH into an unowned library (T1574.006); executable
+mappings from a temp directory or from a library no package owns (T1055);
+a tracer attached (T1055); HISTFILE=/dev/null or HISTSIZE=0 (T1070.003);
+PYTHONPATH or NODE_OPTIONS pointing at a temp or home path (T1574);
+PROMPT_COMMAND that is not a known shell integration (T1546.004); raw IP
+connections to public addresses (T1071) and unusual ports (T1571);
+elevated capabilities (T1068); a shell or downloader whose ancestor is a
+document viewer (T1204.002); a file in a container that its image does not
+own (T1036). A process running a file an upgrade replaced is stale, not
+deleted, and scores 5.
+
+**Verdicts**: "Unverified" is no provenance and no signals; "Suspicious" is
+one signal, or any signal on a process with known provenance; "Likely
+malicious" is two or more signals, or memfd, deleted or masquerade on an
+unverified process. Every point is listed under the row as a reason.
+
+**Rules** in `~/.config/weird/rules.toml` suppress, downgrade, upgrade or
+tag processes by name, path, cmdline, uid, package, trust level, parent or
+direct parent. Built-in rules cover package builds and shells spawned by
+document viewers. Syntax in [docs/rules.md](docs/rules.md).
+
+**Trust levels** say where a file came from, not whether it is safe:
+`OFFICIAL` (signed distro repository), `THIRD_PARTY` (apt package signed by
+another key), `LOCAL_BUILD` (built with makepkg, so the PKGBUILD is the whole
+chain of trust), `USER_PKG` (installed by uv, pipx, npm, cargo, rustup, go or
+nvm; named, but unsigned), `USER_LOCAL` (/usr/local or ~/.local, no
+metadata), `APPIMAGE`, `FLATPAK`, `SNAP`, `CONTAINER`, `KERNEL`,
+`USER_TRUSTED` and `UNKNOWN`. The xz backdoor shipped as OFFICIAL.
+
+## Arch notes
+
+After `pacman -Syu` long running processes keep executing the old, deleted
+file; weird marks them stale rather than critical, and `weird restart-needed`
+lists them by systemd unit with the `systemctl restart` line to run
+(needrestart is not in the official repositories). Packages that did not
+come from a repository (`pacman -Qm`) are LOCAL_BUILD, and `weird aur` reads
+the PKGBUILD behind each one from the paru or yay cache or `--pkgbuild-dir`:
+sources without https or on paste hosts, missing or SKIP checksums, install
+scripts, and a PKGBUILD commit newer than the install date. Trust on Arch is
+the %VALIDATION% pacman recorded (pgp from a distro packager is OFFICIAL,
+anything else LOCAL_BUILD), the SigLevel from pacman.conf is quoted in each
+package's evidence, and a LocalFileSigLevel that lets unsigned packages
+install prints a warning at the top of every scan. Pacman hooks and
+makepkg.conf are persistence sources for `weird persist`.
+
+## Real-time
+
+`weird watch` polls /proc every 2 seconds (`--poll SECONDS`) and prints one
+NDJSON line per new process that scores, keyed by pid and start time. No
+root, no Falco. With [weird-sensor](https://github.com/travershartstone93/weird-sensor),
+a small eBPF program that writes exec, exit, memfd, ptrace, module, bpf and
+connect events to `/run/weird/events.ndjson` as root, `weird watch --events
+PATH` judges a process within its first second and turns module and bpf
+loads into findings; when the file is fresh `weird watch` picks it by
+itself. `weird watch --falco` runs Falco with the rules from
+`weird falco-rules`. Event schema in [docs/events.md](docs/events.md).
+
+```bash
+weird watch | jq -r '"\(.verdict) \(.name) pid \(.pid): \(.reasons[0])"'
 ```
+
+## Scheduled scans and outputs
+
+`--journal` writes each alert to journald as `SYSLOG_IDENTIFIER=weird` with
+`WEIRD_PID`, `WEIRD_NAME`, `WEIRD_SCORE`, `WEIRD_TRUST`, `WEIRD_ATTACK` and
+`WEIRD_VERDICT` fields (`journalctl -t weird`). `--prometheus PATH` writes a
+node_exporter textfile with `weird_alerts`, `weird_processes_total` and the
+scan timestamp and duration, renamed into place atomically. `systemd/`
+ships user timer units for a daily scan and a daily persistence check:
+
+```bash
+systemctl --user link "$PWD/systemd/weird.service" "$PWD/systemd/weird.timer"
+systemctl --user enable --now weird.timer
+```
+
+## Offline mode
+
+Boot live media, mount the suspect disk, and let a kernel the attacker does
+not control read it:
+
+```bash
+weird offline /mnt/root          # persistence, integrity of every packaged executable, aur
+weird offline /mnt/root --json   # {sysroot, sections: {persist, integrity, aur}, findings, counts}
+```
+
+No process scan, `/` refused without `--force`, exit 2/1/0 as usual.
+
+## Testing
+
+```bash
+python3 -m unittest discover -s tests      # about 340 tests, around 90 seconds
+```
+
+Most tests build a fake /proc and a fake package database (Arch and Debian
+shaped) under `tests/.sandbox` and run the real code against them with
+`--proc-root` and `--sysroot`, so they pass on any distribution without
+root. The emulation tests in `tests/test_emulation.py` are different: they
+start harmless decoys on the host (a copy of sleep named sshd under /tmp,
+a deleted executable, a memfd exec, an LD_PRELOAD of a real library, a
+ptrace attach) and prove the live scan catches each one with the expected
+reason and ATT&CK id. `weird fixture record PID DIR` captures a real
+process into a tree the suite can replay, so a scenario seen once can
+become a test without shipping anything dangerous. CI runs the suite on
+Ubuntu (Python 3.12 and 3.13) and in an Arch Linux container.
+
+## How it compares
+
+Falco and Tetragon watch syscalls in real time through eBPF, need root and a
+kernel module or BPF programs, and know nothing about packages; weird is a
+user-space snapshot and provenance tool that exports Falco rules and
+consumes the weird-sensor stream when real-time matters. rkhunter and
+chkrootkit match known rootkit signatures and file names; weird has no
+signature list and asks where each file came from instead. unhide finds
+hidden pids by the same readdir versus stat walk that `weird hidden` does,
+and stops there. needrestart tells you what to restart after an upgrade
+and is not in the official Arch repositories; `weird restart-needed` is
+the equivalent, built from the same stale-file detection the scanner uses.
+osquery answers any question you can write as SQL; weird ships the
+questions. AIDE, debsums and `pacman -Qkk` check files on disk against a
+database; weird applies the package hashes to what is running and to what
+is set to run. Lynis audits hardening settings; the posture block of
+`weird kernel` overlaps with its kernel section and nothing else.
+
+No user-space tool defeats a kernel rootkit. weird detects the userspace
+class via the static probe and cross-views, catches sloppy kernel rootkits
+through module and eBPF cross-views, reports whether the kernel is hookable
+at all, and has an offline mode for when you need certainty.
 
 ## Files
 
-- `~/.config/weird/config.toml`: Policy configuration
-- `~/.config/weird/rules.toml`: User rules
-- `~/.config/weird/user_trusted.txt`: User trusted list
-- `~/.config/weird/cache/file_package_map.json`: File → package cache
-- `~/.config/weird/baseline.json`: Baseline data
-
-## Help
-
-```bash
-weird --help
-weird man
-```
+`~/.config/weird/` holds `config.toml`, `rules.toml`, `user_trusted.txt`,
+`baseline.json`, `trusted.json` and the file to package cache. `package.json`
+carries the sha256 pin of `bin/weird` that `weird self-check` verifies;
+`scripts/update-pin.py` records a new one after an intended change.
 
 ## License
 
