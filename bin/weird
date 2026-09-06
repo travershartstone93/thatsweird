@@ -8,6 +8,8 @@ Identifies suspicious processes by:
 - Inspecting ambiguous processes to understand what they're doing
 - Checking if flagged PIDs have network connections
 """
+from __future__ import annotations
+
 
 import argparse
 import contextlib

@@ -35,7 +35,7 @@
     "node": ">=14"
   },
   "weirdIntegrity": {
-    "sha256": "da3ebbe35099ef76ab0a0644ec37e72af18e2d78b555d088c7d2aa36553d276e",
+    "sha256": "f7bce82bd8060c090b25893a7800b9a094dc4641225906940749b18654c2c430",
     "version": "1.1.0"
   }
 }
