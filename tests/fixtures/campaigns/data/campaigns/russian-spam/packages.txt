@@ -1,0 +1,20 @@
+# Russian spam campaign: AUR packages injecting spam into shell configs (trimmed fixture)
+# Source: Sid Karunaratne, AUR REPORT THREAD, 2026-06-14
+# https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/message/2YQSHTC27MOKDDKHZTH2BJGTEN2CYC7W/
+#
+# These AUR packages had PKGBUILD modifications that inject Russian spam
+# echo statements into ~/.bashrc, ~/.zshrc, etc. at install time.
+# This is a SEPARATE campaign from the JS supply-chain attack (atomic-lockfile
+# / lockfile-js / nextfile-js / js-digest).
+#
+# Status: reported to Arch DevOps, cleanup in progress as of 2026-06-14.
+algobox
+alist-desktop-bin
+arpoison
+asymptote-git
+aurbs
+blackfire-cli
+ccsm-git
+chinadns
+closure-hib
+cmaptools
