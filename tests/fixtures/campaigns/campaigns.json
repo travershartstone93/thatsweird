@@ -1,0 +1,259 @@
+{
+  "campaigns": [
+    {
+      "id": "aur-infected",
+      "type": "aur",
+      "display": "AUR malware packages (June 2026)",
+      "lists": ["data/campaigns/aur-infected/packages.txt", "data/campaigns/aur-infected/packages-extra.txt"],
+      "npm_lists": ["data/campaigns/aur-infected/npm-packages.txt"],
+      "date_window": { "start": "2026-06-09", "end": "2026-06-14" },
+      "refresh_url": "https://md.archlinux.org/s/SxbqukK6IA/download",
+      "refresh_target": "data/campaigns/aur-infected/packages.txt",
+      "campaign_tag": null,
+      "env_start": "START_DATE",
+      "env_end": "END_DATE",
+      "ioc_files": [
+        {
+          "path": "~/.local/bin/sudo",
+          "sha256": "fd4852334ce1c2d7c9bf0e1c91dbf274a1247989b4827d4f7758cbf3bf42ebfe",
+          "description": "Sudo password grabber"
+        }
+      ],
+      "sources": {
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/FGXPCB3ZVCJIV7FX323SBAX2JHYB7ZS4/": {
+          "date": "2026-06-11",
+          "comment": "Master package list on aur-general"
+        },
+        "https://md.archlinux.org/s/SxbqukK6IA/download": {
+          "date": "2026-06-12",
+          "comment": "Official HedgeDoc with updated affected package list"
+        },
+        "https://ioctl.fail/preliminary-analysis-of-aur-malware/": {
+          "date": "2026-06-11",
+          "comment": "Technical analysis and IOCs"
+        },
+        "https://discourse.ifin.network/t/400-aur-packages-compromised-with-infostealer-and-rootkit/577": {
+          "date": "2026-06-11",
+          "comment": "IFIN Discourse attack summary and updates"
+        },
+        "https://socket.dev/npm/package/atomic-lockfile": {
+          "date": "2026-06-11",
+          "comment": "Malicious npm package metadata"
+        },
+        "https://socket.dev/npm/package/js-digest": {
+          "date": "2026-06-12",
+          "comment": "bun/js-digest wave package metadata"
+        },
+        "data/campaigns/aur-infected/iocs.txt": {
+          "date": "2026-06-11",
+          "comment": "Indicators of Compromise (prose)"
+        },
+        "data/campaigns/aur-infected/iocs.json": {
+          "date": "2026-06-24",
+          "comment": "Indicators of Compromise (structured)"
+        },
+        "data/campaigns/aur-infected/accounts.json": {
+          "date": "2026-06-24",
+          "comment": "Attacker accounts for this campaign"
+        },
+        "https://github.com/lenucksi/aur-malware-check/issues/24": {
+          "date": "2026-06-15",
+          "comment": "Sudo password grabber IOC"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/message/NHRO2RT3VRXHQ7O4WQCPTNGNIOQQQAWX/": {
+          "date": "2026-06-13",
+          "comment": "a821 wave 2 obfuscated bun discovery"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/message/TND7HA2KBQ46OHHUMMIAHKGXZE4WALM6/": {
+          "date": "2026-06-14",
+          "comment": "Nicolas Boichat htbrowser-bin Gemma analysis"
+        },
+        "https://www.phoronix.com/news/Arch-Linux-AUR-More-Malware": {
+          "date": "2026-06-14",
+          "comment": "Phoronix coverage of wave 2"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/message/FEQAUX55CKTWAGSYQKQY5ZMPWNUW7UXM/": {
+          "date": "2026-06-15",
+          "comment": "Holger Schramm report: rakudo-star compromised"
+        },
+        "https://github.com/lenucksi/aur-malware-check/pull/30": {
+          "date": "2026-06-15",
+          "comment": "PR #30 (gumaath): rakudo-star package list addition"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/message/NHRO2RT3VRXHQ7O4WQCPTNGNIOQQQAWX/": {
+          "date": "2026-06-13",
+          "comment": "a821 wave 2 obfuscated bun discovery"
+        },
+        "https://archlinux.org/news/active-aur-malicious-packages-incident/": {
+          "date": "2026-06-12",
+          "comment": "Official Arch Linux announcement - AUR made read-only"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/message/FCH7TT6IOVT7D477JKSVJALBKADAARSW/": {
+          "date": "2026-06-12",
+          "comment": "Jonathan Grotelüschen posts HedgeDoc link on aur-general"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/2LGBF2AZBPVCCY4VTN6DOVUNNBURFJ2J/": {
+          "date": "2026-06-11",
+          "comment": "Kusoneko: first public report - suspicious alvr commit"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/LB6TBHDXLQRPR4UVIQULCI6MZ77XYLL2/": {
+          "date": "2026-06-12",
+          "comment": "js-digest wave: custodiatovar & veramagalhaes accounts"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/LVYB62N3FPAWUHNJ5Z5GXG6OIR7S5P3F/": {
+          "date": "2026-06-11",
+          "comment": "Fabio Loli: franziskaweber, tobiaswesterburg, ellenmyklebust"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/CIKQJQI3AREXIR6IQVWPBYFJPYLM45EF/": {
+          "date": "2026-06-11",
+          "comment": "Sasha Moak: additional suspicious packages"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/NCLGU23LSLOFXMBGG7HH67EWDZC2TJB3/": {
+          "date": "2026-06-13",
+          "comment": "Joom: ivonahruskova - 16 adoptions, under monitoring"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/K2ZO3U4WPV7BBT2WAP5P54F23A37RUPH/": {
+          "date": "2026-06-12",
+          "comment": "Paul: simongeisler - 3-day-old account, 16 orphan adoptions"
+        },
+        "https://github.com/fardewoak/nodejs-argo/pkgs/container/herbsobering430": {
+          "date": "2026-06-11",
+          "comment": "Attacker GitHub Container Registry - reverse shell/proxy tool"
+        },
+        "https://aur.archlinux.org/cgit/aur.git/commit/?h=premake-git&id=232b22dd0aaedfa9fde1800710e0d52e4f4b542d": {
+          "date": "2026-06-09",
+          "comment": "Example malicious PKGBUILD commit with npm install payload"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/WJ5CH64QMWSFGIJYFSRVEFLSNI7JSKPR/": {
+          "date": "2026-06-13",
+          "comment": "Proposal: compile per-package affected commit hashes + date ranges"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/WS2K2XGMLPBFZ3WGOPLF2UP32HZJ6ZSP/": {
+          "date": "2026-06-13",
+          "comment": "Proposal: make AUR read-only - 16 participants"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/7QZREKFQX3P3UOQNUYJOXANPK4PFH733/": {
+          "date": "2026-06-12",
+          "comment": "Idea for preventing malicious packages"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/E26JEFVSR6YG4GBQUZYDMWYCXD7S7N5V/": {
+          "date": "2026-06-13",
+          "comment": "AURSCAN: LLM-based PKGBUILD scanner proposal"
+        },
+        "https://github.com/lenucksi/aur-malware-check/pull/8": {
+          "date": "2026-06-13",
+          "comment": "PR #8 (drbbgh): --refresh flag for live HedgeDoc list"
+        },
+        "https://github.com/lenucksi/aur-malware-check/pull/7": {
+          "date": "2026-06-13",
+          "comment": "PR #7 (liphiwolf): lockfile-js detection"
+        },
+        "https://github.com/lenucksi/aur-malware-check/pull/4": {
+          "date": "2026-06-13",
+          "comment": "PR #4 (0xf836): package list expansion"
+        },
+        "data/campaigns/aur-infected/SOURCES.md": {
+          "date": "2026-06-24",
+          "comment": "Annotated source references for this campaign"
+        },
+        "data/campaigns/aur-infected/timeline.md": {
+          "date": "2026-06-24",
+          "comment": "Incident timeline and attack vector details"
+        }
+      }
+    },
+    {
+      "id": "chaos-rat",
+      "type": "aur",
+      "display": "CHAOS RAT campaign, 2025-07",
+      "lists": ["data/campaigns/chaos-rat/packages.txt"],
+      "date_window": { "start": "2025-07-16", "end": "2025-07-19" },
+      "refresh_url": null,
+      "refresh_target": null,
+      "campaign_tag": "CHAOS RAT campaign, 2025-07",
+      "env_start": "CHAOS_START_DATE",
+      "env_end": "CHAOS_END_DATE",
+      "sources": {
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/LPDIQKHTREE3TH35PDRZ4YOTVOHKYQSF/": {
+          "date": "2025-07-17",
+          "comment": "Initial CHAOS RAT report on aur-general"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/BNPJ24CFMGCOCXCWZY5ILODLPCYNTTO4/": {
+          "date": "2025-07-18",
+          "comment": "Extended package list and discussion"
+        },
+        "data/campaigns/chaos-rat/iocs.json": {
+          "date": "2026-06-24",
+          "comment": "Indicators of Compromise (none known - empty)"
+        },
+        "https://linuxsecurity.com/features/chaos-rat-in-aur": {
+          "date": "2025-07-22",
+          "comment": "Linux Security: CHAOS RAT AUR incident analysis"
+        },
+        "https://www.bleepingcomputer.com/news/security/arch-linux-pulls-aur-packages-that-installed-chaos-rat-malware/": {
+          "date": "2025-07-22",
+          "comment": "BleepingComputer: removal timeline"
+        },
+        "https://www.theregister.com/2025/07/22/arch_aur_browsers_compromised/": {
+          "date": "2025-07-22",
+          "comment": "The Register: independent report"
+        },
+        "https://itsfoss.com/news/arch-linux-chaos-rat/": {
+          "date": "2025-08-04",
+          "comment": "It's FOSS: public reporting summary"
+        },
+        "https://discuss.privacyguides.net/t/security-firefox-patch-bin-librewolf-fix-bin-and-zen-browser-patched-bin-aur-packages-contain-malware/29232": {
+          "date": "2025-07",
+          "comment": "Privacy Guides community: additional packages"
+        },
+        "data/campaigns/chaos-rat/SOURCES.md": {
+          "date": "2026-06-24",
+          "comment": "Annotated source references for this campaign"
+        }
+      }
+    },
+    {
+      "id": "russian-spam",
+      "type": "aur",
+      "display": "Russian spam packages",
+      "lists": ["data/campaigns/russian-spam/packages.txt"],
+      "npm_lists": [],
+      "date_window": null,
+      "refresh_url": null,
+      "refresh_target": null,
+      "campaign_tag": null,
+      "env_start": null,
+      "env_end": null,
+      "sources": {
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/NSWKBW4LZPRNA3H3OXUQID6PWKVHC5U4/": {
+          "date": "2026-06-14",
+          "comment": "Remco R.: pingwin840 - Russian spam in shell rc files"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/YILFY3UVTAQWYOGLENYTDVHUVYOHG46O/": {
+          "date": "2026-06-14",
+          "comment": "Nicolas Bérigaud: pingwin840 orphan package takeover"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/EYL4UQPCQMWP3L4VPM655T7Q5CXPUGNN/": {
+          "date": "2026-06-14",
+          "comment": "Дневник UNIX'оида: pingwin840 Russian insults in post_install"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/EMPER2HAX3DRMZTVGWOLIRUQZ2PYQIEQ/": {
+          "date": "2026-06-14",
+          "comment": "Felipe Contreras Salinas: charlottedurand suspicious account"
+        },
+        "https://github.com/lenucksi/aur-malware-check/issues/20": {
+          "date": "2026-06-15",
+          "comment": "Issue #20 (jotebe): pingwin840/charlottedurand attack candidates"
+        },
+        "https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/message/2YQSHTC27MOKDDKHZTH2BJGTEN2CYC7W/": {
+          "date": "2026-06-14",
+          "comment": "Sid Karunaratne: initial russian spam report (73 packages)"
+        },
+        "data/campaigns/russian-spam/SOURCES.md": {
+          "date": "2026-06-24",
+          "comment": "Annotated source references for this campaign"
+        }
+      }
+    }
+  ]
+}

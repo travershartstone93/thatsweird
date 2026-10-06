@@ -19,6 +19,7 @@ Description=weird anomaly report (processes, persistence, kernel, AUR, hidden)
 Documentation=https://github.com/travershartstone93/thatsweird
 
 [Service]
+Environment=WEIRD_NO_PROMPT=1
 Type=oneshot
 ExecStart=/usr/bin/env weird --json --journal --prometheus %h/.local/share/node_exporter/weird.prom
 # Exit 1 (medium) and 2 (critical) mean the run found things, not that the unit failed.

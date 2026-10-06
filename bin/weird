@@ -9467,6 +9467,9 @@ AUR_SECURE_SCHEMES = ("https", "git+https", "hg+https", "svn+https", "bzr+https"
 AUR_VCS_PREFIXES = ("git", "hg", "svn", "bzr", "fossil")
 AUR_CHECKSUM_ALGOS = ("b2", "sha512", "sha384", "sha256", "sha224", "sha1", "md5", "ck")
 AUR_EXPLANATIONS = {
+    "known-bad package": "This package name is on a published list of AUR packages compromised during a known "
+                         "campaign. Remove it, read its PKGBUILD and install scripts, and check for the campaign's "
+                         "indicators (github.com/lenucksi/aur-malware-check).",
     "insecure source": "makepkg downloads this source without TLS (or from a throwaway paste host): "
                        "anyone on the path can swap the archive, and a paste host is not a release channel.",
     "PKGBUILD modified after install": "The cached PKGBUILD changed since this version was built and "
@@ -9767,8 +9770,7 @@ def check_aur_packages(pkgbuild_dir: Optional[str] = None, local_db_only: bool =
     return packages
 
 
-# =============================================================================
-# Round 2 AUR checks: pacman.log history and language-manager caches
+# ======================================================================# Round 2 AUR checks: pacman.log history and language-manager caches
 # =============================================================================
 
 PACMAN_LOG = "/var/log/pacman.log"
@@ -9972,21 +9974,356 @@ def language_cache_findings() -> List[Finding]:
                                             f"{label}: {name} fetched {stamp} while {aur_pkg} was being built",
                                             "medium", "T1195.001", aur_pkg))
     return findings
+# -----------------------------------------------------------------------------
+# Known-bad AUR package lists (campaigns from github.com/lenucksi/aur-malware-check)
+# -----------------------------------------------------------------------------
+
+CAMPAIGNS_URL = "https://raw.githubusercontent.com/lenucksi/aur-malware-check/main/data/campaigns.json"
+CAMPAIGNS_DIR = CONFIG_DIR / "campaigns"
+CAMPAIGNS_FILE = CAMPAIGNS_DIR / "campaigns.json"
+CAMPAIGNS_META = CAMPAIGNS_DIR / "meta.json"
+CAMPAIGNS_MAX_BYTES = 5 * 1024 * 1024
+CAMPAIGNS_TIMEOUT = 20
+CAMPAIGNS_MAX_AGE_DAYS = 7
+CAMPAIGN_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+-]*$")
+CAMPAIGN_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class CampaignFetchError(Exception):
+    pass
+
+
+@dataclass
+class Campaign:
+    id: str
+    label: str
+    start: str
+    end: str
+    packages: Set[str] = field(default_factory=set)
+
+
+def campaign_list_path(base: Path, rel) -> Optional[Path]:
+    """A list file reference from campaigns.json as a path under `base`, or None when it is not a clean relative path."""
+    if not isinstance(rel, str) or not rel or rel.startswith(("/", "~")) or "\\" in rel:
+        return None
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    return base.joinpath(*parts)
+
+
+def read_campaign_packages(path: Path) -> Optional[Set[str]]:
+    """Package names from a list file: one per line, # comments ignored, odd names dropped. None when unreadable."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    names: Set[str] = set()
+    for line in text.splitlines():
+        name = line.split("#", 1)[0].strip()
+        if name and CAMPAIGN_PACKAGE_RE.match(name):
+            names.add(name.lower())
+    return names
+
+
+def parse_campaigns(path: Path) -> Tuple[List[Campaign], int]:
+    """Campaigns from a campaigns.json plus the list files it names (relative to its directory).
+
+    Only ids, labels, date windows and package names are read; every other field
+    is ignored. Returns (campaigns, number of malformed entries or missing list
+    files skipped). Nothing from the file is ever executed or evaluated.
+    """
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return [], 1
+    entries = data.get("campaigns") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return [], 1
+    base = path.parent
+    campaigns: List[Campaign] = []
+    skipped = 0
+    for entry in entries:
+        cid = entry.get("id") if isinstance(entry, dict) else None
+        if not isinstance(cid, str) or not cid.strip():
+            skipped += 1
+            continue
+        label = entry.get("display") or entry.get("label") or entry.get("name") or cid
+        window = entry.get("date_window")
+        window = window if isinstance(window, dict) else {}
+        start, end = (str(window.get(k) or "") for k in ("start", "end"))
+        start = start if CAMPAIGN_DATE_RE.match(start) else ""
+        end = end if CAMPAIGN_DATE_RE.match(end) else ""
+        packages: Set[str] = set()
+        bad_lists = 0
+        inline = entry.get("packages")
+        if isinstance(inline, list):
+            packages |= {str(n).strip().lower() for n in inline
+                         if isinstance(n, str) and CAMPAIGN_PACKAGE_RE.match(n.strip())}
+        lists = entry.get("lists")
+        for rel in (lists if isinstance(lists, list) else []):
+            list_path = campaign_list_path(base, rel)
+            if list_path is not None and not list_path.is_file():
+                list_path = campaign_list_path(base.parent, rel)  # a clone keeps campaigns.json under data/
+            names = read_campaign_packages(list_path) if list_path else None
+            if names is None:
+                bad_lists += 1
+                continue
+            packages |= names
+        if not packages:
+            skipped += 1
+            continue
+        skipped += bad_lists
+        campaigns.append(Campaign(cid.strip(), str(label).strip() or cid.strip(), start, end, packages))
+    return campaigns, skipped
+
+
+def load_campaigns(path: Path) -> List[Campaign]:
+    return parse_campaigns(path)[0]
+
+
+def read_campaigns_meta(path: Path = CAMPAIGNS_META) -> Dict:
+    if not path.is_file() or not private_file_ok(path):
+        return {}
+    try:
+        meta = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def campaigns_status(campaigns: List[Campaign], meta: Dict) -> str:
+    """Header text: '3 campaigns, 1612 packages, fetched 2026-10-05' or 'not available'."""
+    if not campaigns:
+        return "not available"
+    count = len(set().union(*(c.packages for c in campaigns)))
+    text = f"{len(campaigns)} campaigns, {count} packages"
+    fetched = meta.get("fetched_at")
+    if isinstance(fetched, (int, float)) and fetched > 0:
+        text += ", fetched " + time.strftime("%Y-%m-%d", time.localtime(fetched))
+    return text
+
+
+def campaigns_max_age_days() -> int:
+    """campaigns_max_age_days from config.toml (top level or [policy]), default 7."""
+    if tomllib and CONFIG_FILE.exists():
+        try:
+            data = tomllib.loads(CONFIG_FILE.read_text())
+            value = data.get("campaigns_max_age_days", data.get("policy", {}).get("campaigns_max_age_days"))
+            if value is not None:
+                return max(0, int(value))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return CAMPAIGNS_MAX_AGE_DAYS
+
+
+def helper_cache_names(pkgbuild_dir: Optional[str] = None) -> Set[str]:
+    """Package names with a clone in the AUR helper caches (built here at some point)."""
+    names: Set[str] = set()
+    for directory in pkgbuild_dirs(pkgbuild_dir):
+        try:
+            for entry in directory.iterdir():
+                if entry.is_dir() and CAMPAIGN_PACKAGE_RE.match(entry.name):
+                    names.add(entry.name.lower())
+        except OSError:
+            continue
+    return names
+
+
+def apply_campaigns(campaigns: List[Campaign], packages: List[AurPackage], cache_names: Set[str]) -> List[Finding]:
+    """Installed foreign packages on a list get a critical finding on the package; cache-only hits come back as info."""
+    extra: List[Finding] = []
+    installed = {p.name.lower() for p in packages}
+    for campaign in campaigns:
+        window = f"window {campaign.start or 'unknown'} to {campaign.end or 'unknown'}"
+        for pkg in packages:
+            if pkg.name.lower() in campaign.packages:
+                when = f", installed {time.strftime('%Y-%m-%d', time.localtime(pkg.installdate))}" if pkg.installdate else ""
+                pkg.findings.append(Finding("known-bad package",
+                                            f"installed package {pkg.name} is on the {campaign.label} compromised "
+                                            f"list ({window}){when}", "critical", "T1195.002", pkg.name))
+        for name in sorted(campaign.packages & cache_names - installed):
+            extra.append(Finding("known-bad package built", f"campaign package {name} was built on this machine "
+                                 f"but is not installed ({campaign.label}, {window})", "info", "T1195.002", name))
+    return extra
+
+
+def campaigns_host_ok(url: str) -> bool:
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and (host in ("github.com", "githubusercontent.com") or
+                                        host.endswith((".github.com", ".githubusercontent.com")))
+
+
+def same_domain_redirect_handler():
+    """urllib redirect handler that refuses any redirect leaving github.com / githubusercontent.com."""
+    import urllib.request
+
+    class SameDomainRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not campaigns_host_ok(newurl):
+                raise CampaignFetchError(f"redirect to {newurl} refused")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return SameDomainRedirects
+
+
+def download_url(url: str, max_bytes: int = CAMPAIGNS_MAX_BYTES, timeout: int = CAMPAIGNS_TIMEOUT) -> bytes:
+    """HTTPS GET with urllib: github.com and githubusercontent.com only, redirects elsewhere refused, size capped."""
+    import urllib.error
+    import urllib.request
+
+    if not campaigns_host_ok(url):
+        raise CampaignFetchError(f"refusing to fetch {url}: not an https github.com address")
+    opener = urllib.request.build_opener(same_domain_redirect_handler())
+    try:
+        with opener.open(urllib.request.Request(url, headers={"User-Agent": "weird"}), timeout=timeout) as resp:
+            data = resp.read(max_bytes + 1)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise CampaignFetchError(str(getattr(exc, "reason", exc) or exc))
+    if len(data) > max_bytes:
+        raise CampaignFetchError(f"{url} is larger than {max_bytes // (1024 * 1024)} MB")
+    return data
+
+
+def write_private_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(temp_file, "wb") as f:
+            os.chmod(temp_file, 0o600)
+            f.write(data)
+        temp_file.rename(path)
+    except OSError:
+        if temp_file.exists():
+            temp_file.unlink()
+        raise
+
+
+def fetch_campaigns(url: str = CAMPAIGNS_URL, dest: Path = CAMPAIGNS_DIR, download=download_url) -> Path:
+    """Download campaigns.json and the list files it names into `dest`, write meta.json, print one summary line.
+
+    Raises CampaignFetchError; the caller prints it and carries on without the list.
+    """
+    raw = download(url)
+    if len(raw) > CAMPAIGNS_MAX_BYTES:
+        raise CampaignFetchError("campaigns.json is larger than 5 MB")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise CampaignFetchError(f"campaigns.json is not valid JSON: {exc}")
+    entries = data.get("campaigns") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        raise CampaignFetchError("campaigns.json has no campaigns list")
+    base_url = url.rsplit("/", 1)[0].rsplit("/data", 1)[0] if "/data/" in url else url.rsplit("/", 1)[0]
+    total = len(raw)
+    files = []
+    dest = Path(dest)
+    for entry in entries:
+        lists = entry.get("lists") if isinstance(entry, dict) else None
+        for rel in (lists if isinstance(lists, list) else []):
+            target = campaign_list_path(dest, rel)
+            if target is None:
+                raise CampaignFetchError(f"campaigns.json names an unsafe list path: {rel!r}")
+            blob = download(f"{base_url}/{rel}")
+            total += len(blob)
+            if total > CAMPAIGNS_MAX_BYTES:
+                raise CampaignFetchError("list files add up to more than 5 MB")
+            write_private_bytes(target, blob)
+            files.append(rel)
+    write_private_bytes(dest / "campaigns.json", raw)
+    campaigns, _ = parse_campaigns(dest / "campaigns.json")
+    newest = max((d for c in campaigns for d in (c.start, c.end) if d), default="")
+    count = len(set().union(*(c.packages for c in campaigns))) if campaigns else 0
+    sha = hashlib.sha256(raw).hexdigest()
+    write_private_json(dest / "meta.json", {"fetched_at": int(time.time()), "url": url, "sha256": sha, "size": total,
+                                            "newest_campaign_date": newest, "package_count": count, "files": files})
+    print(f"known-bad list fetched: {total} bytes, sha256 {sha}, newest campaign {newest or 'unknown'}, "
+          f"{count} packages, {len(campaigns)} campaigns")
+    return dest / "campaigns.json"
+
+
+def maybe_offer_campaign_update(args, ask=None, fetch=None) -> Optional[Path]:
+    """Which campaigns file the aur scan should use, after the one place a fetch may be offered.
+
+    --campaigns PATH: that file, no prompt, no fetch. --fetch-campaigns: fetch now
+    without asking. Otherwise a [y/N] question is asked only on a terminal (stdin
+    and stdout), never under --json/--ndjson, in watch mode, with --no-prompt or
+    with WEIRD_NO_PROMPT set; Enter or EOF means no. A failed fetch prints one
+    line and the scan continues with whatever is cached.
+    """
+    ask = ask or input
+    fetch = fetch or fetch_campaigns
+    chosen = getattr(args, "campaigns", None)
+    if chosen:
+        return Path(chosen)
+    cached = CAMPAIGNS_FILE if CAMPAIGNS_FILE.is_file() and private_file_ok(CAMPAIGNS_FILE) else None
+    meta = read_campaigns_meta()
+    fetched_at = meta.get("fetched_at") if isinstance(meta.get("fetched_at"), (int, float)) else 0
+    age_days = int((time.time() - fetched_at) // 86400) if fetched_at else None
+    want = bool(getattr(args, "fetch_campaigns", False))
+    if not want:
+        interactive = (sys.stdin.isatty() and sys.stdout.isatty() and not getattr(args, "json", False)
+                       and not getattr(args, "ndjson", False) and not getattr(args, "watch", False)
+                       and getattr(args, "command", None) != "watch" and not getattr(args, "no_prompt", False)
+                       and not os.environ.get("WEIRD_NO_PROMPT"))
+        if not interactive:
+            return cached
+        if cached is None:
+            question = ("Known-bad AUR package list: not downloaded. Fetch it from "
+                        "github.com/lenucksi/aur-malware-check? [y/N] ")
+        elif age_days is None or age_days > campaigns_max_age_days():
+            shown = f"{age_days} days ago" if age_days is not None else "at an unknown time"
+            question = f"Known-bad AUR package list: last updated {shown}. Update it? [y/N] "
+        else:
+            return cached
+        try:
+            answer = ask(question)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = ""
+        if str(answer).strip().lower() not in ("y", "yes"):
+            return cached
+    try:
+        return fetch()
+    except CampaignFetchError as exc:
+        print(f"known-bad list not fetched: {exc}")
+    except Exception as exc:  # any other failure: continue without the list, exit codes unaffected
+        print(f"known-bad list not fetched: {exc.__class__.__name__}: {exc}")
+    return cached
+
+
+def campaigns_for_scan(path: Optional[Path]) -> Tuple[List[Campaign], Dict]:
+    """Loaded campaigns and the meta.json next to them (empty when there is no usable file)."""
+    if path is None or not Path(path).is_file():
+        return [], {}
+    campaigns, skipped = parse_campaigns(Path(path))
+    if skipped:
+        debug_log("campaigns", f"{skipped} malformed campaign entries or missing list files skipped in {path}")
+    return campaigns, read_campaigns_meta(Path(path).parent / "meta.json")
 
 
 def cmd_aur(args) -> int:
     """Supply chain checks on the PKGBUILDs behind locally built (AUR) packages."""
     started = time.monotonic()
+    campaigns, campaigns_meta = campaigns_for_scan(maybe_offer_campaign_update(args))
     packages = check_aur_packages(getattr(args, "pkgbuild_dir", None))
     findings = [f for pkg in packages for f in pkg.findings]
     findings += language_cache_findings()
+    extra = apply_campaigns(campaigns, packages, helper_cache_names(getattr(args, "pkgbuild_dir", None)))
+    known_bad = campaigns_status(campaigns, campaigns_meta)
+    if not campaigns:
+        known_bad += " (run interactively to fetch, or pass --campaigns PATH)"
+    findings = [f for pkg in packages for f in pkg.findings] + extra
     sort_findings(findings)
     note_counts(finding_counts(findings))
     code = findings_exit_code(findings)
     emit_findings_outputs(args, "aur", findings, started)
 
     if args.json:
-        payload = finding_payload(findings, packages=[
+        payload = finding_payload(findings, known_bad_list=known_bad, packages=[
             {"name": p.name, "version": p.version, "base": p.base, "installdate": p.installdate,
              "packager": p.packager, "validation": p.validation, "pkgbuild": p.pkgbuild,
              "findings": [asdict(f) for f in p.findings]} for p in packages])
@@ -9997,6 +10334,10 @@ def cmd_aur(args) -> int:
         print("No foreign packages installed.")
         return 0
     show_all = getattr(args, "all", False) or getattr(args, "verbose", False)
+    if campaigns and not any(f.kind == "known-bad package" for f in findings):
+        known_bad += f"; none of the {len(packages)} foreign packages is on any list"
+    print(f"known-bad list: {known_bad}")
+    show_all = getattr(args, "all", False)
     shown = [f for f in findings if show_all or f.severity != "info"]
     if shown:
         print_findings(shown, AUR_EXPLANATIONS, subject_header="PACKAGE")
@@ -10739,6 +11080,10 @@ def add_dev_commands(parser: argparse.ArgumentParser) -> None:
                             help="Also list info entries (install scripts, VCS sources, unavailable PKGBUILDs)")
     aur_parser.add_argument("--pkgbuild-dir", dest="pkgbuild_dir", metavar="DIR",
                             help="Directory holding <package>/PKGBUILD clones, checked before the paru and yay caches")
+    aur_parser.add_argument("--campaigns", metavar="PATH",
+                            help="Known-bad package list (campaigns.json) to use; never fetches or prompts")
+    aur_parser.add_argument("--fetch-campaigns", dest="fetch_campaigns", action="store_true",
+                            help="Download the known-bad package list now without asking")
     output_flags(aur_parser)
 
     # self-check subcommand
@@ -10951,6 +11296,10 @@ def run_all(args) -> Tuple[Dict, Dict, int]:
     sections: Dict[str, object] = {}
     summary = {"critical": 0, "medium": 0, "low": 0, "info": 0}
     exit_code = 0
+    if "aur" not in getattr(args, "skip", None or []):
+        chosen = maybe_offer_campaign_update(args)
+        if chosen is not None:
+            args.campaigns = str(chosen)
     plan = [
         ("processes", cmd_scan, "Processes", {}),
         ("aur", cmd_aur, "AUR packages", {}),

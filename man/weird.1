@@ -361,6 +361,21 @@ same package it is \fBcritical\fR. Foreign packages that still carry a pgp
 signature or have no clone are info. \fB\-\-all\fR lists the info entries,
 \fB\-\-json\fR prints host, timestamp, packages, findings and counts. Exit
 status is 2 with any critical finding, 1 with any medium one, 0 otherwise.
+.IP
+Foreign packages are also matched against the known-bad campaign lists from
+github.com/lenucksi/aur-malware-check (ids, labels, date windows and package
+names only; nothing in the file is executed). An installed package on a list is
+\fBcritical\fR (T1195.002) with the campaign window and install date; a name
+only present in the paru or yay cache is info. The list is kept under
+~/.config/weird/campaigns (0600) with meta.json (sha256, size, newest campaign
+date). On a terminal, when no list is cached or it is older than
+campaigns_max_age_days (config.toml, default 7), one [y/N] question offers to
+download it; Enter means no. Never asked without a terminal, under
+\fB\-\-json\fR, \fB\-\-ndjson\fR, in watch mode, with \fB\-\-no\-prompt\fR or
+with WEIRD_NO_PROMPT set. \fB\-\-campaigns\fR \fIPATH\fR uses that file and never
+fetches; \fB\-\-fetch\-campaigns\fR downloads without asking (https, 20 s,
+5 MB, redirects off github.com refused). A failed download prints one line and
+the scan continues; the aur header shows the list status.
 .TP
 .B watch
 Poll /proc every 2 seconds (\fB\-\-poll\fR \fISECONDS\fR) and score only processes
