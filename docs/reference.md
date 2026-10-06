@@ -83,6 +83,19 @@ weird persist --json   # {host, timestamp, entries, counts}
 
 Exit code is 2 with any critical entry, 1 with any medium one, 0 otherwise.
 
+Round 2 additions (no root needed):
+
+- PATH shadowing: a file in a user-writable PATH directory (also ~/.local/bin
+  and ~/bin) named like a watched system binary (sudo, su, ssh, git, pacman,
+  curl, bash ...) is critical [T1036.005]; a symlink to the real binary is info.
+- SSH footholds: ~/.ssh/authorized_keys entries with a forced command,
+  forwarding options, a wildcard from= or no comment are medium, critical when
+  the command lives in a temp dir or an unowned path [T1098.004]; ssh config
+  ProxyCommand/LocalCommand from such paths is medium.
+- Restart loops: a systemd unit with Restart=always or on-failure and a
+  RestartSec under 60 whose target is unowned or user-local is raised one
+  severity step ("restart loop keeps it alive") [T1543.002].
+
 ## Hidden processes, threads and sockets
 
 A rootkit that filters the /proc directory listing hides a process from ps,
@@ -138,6 +151,12 @@ weird self-check                # self-check items, integrity result, both hashe
 python3 scripts/update-pin.py   # after an intended change: record the new hash
 ```
 
+Round 2 additions: /proc/self/mountinfo is checked for mounts placed over
+/proc/<pid> (the way old rootkits hid pids) and for a /proc that is not of
+type proc [T1564]; every pid is also asked for through getpgid(), and a pid
+that one kernel interface knows and the other does not is reported after a
+second check [T1564.001]. The getpgid probe is skipped on replayed trees.
+
 ## Kernel and modules
 
 `weird kernel` looks at the running kernel from the side a rootkit has to
@@ -179,6 +198,13 @@ weird kernel --json    # {host, timestamp, modules, posture, findings, counts}
 ```
 
 Exit code is 2 with any critical finding, 1 with any medium one, 0 otherwise.
+
+Round 2 posture rows: "core dumps" (kernel.core_pattern; a pipe to a handler
+in a temp dir, missing, user writable or unowned is critical [T1546]),
+"modprobe helper" (kernel.modprobe must be a packaged path, otherwise critical
+[T1547.006]) and "kernel cmdline" (audit=0 and a non-standard init= are
+medium, missing ima_policy= and nokaslr are info, module.sig_enforce=1 is a
+positive note).
 
 ## AUR supply chain
 
@@ -222,6 +248,15 @@ weird does **not** sniff packet contents. It builds a process-to-socket view usi
 
 - `ss` (preferred) or `/proc/net` as a fallback
 - Outbound connections by default
+
+Round 2 additions: /var/log/pacman.log (plus rotated .gz/.xz copies) gives a
+per-run install history (`pacman_history()`), used for the install time of
+the "PKGBUILD modified after install" check, for packages installed and later
+removed, and for foreign installs inside given time windows. Language manager
+caches (~/.npm, ~/.bun, ~/.cache/pnpm, yarn, global node_modules) are scanned
+for packages fetched in the 30 minutes before an AUR package whose build uses
+npm, yarn, pnpm or bun was installed: "package fetched during an AUR build"
+(medium, T1195.001). Absent or unreadable caches are skipped.
 
 ## Offline mode (live media)
 
@@ -433,6 +468,11 @@ For UNKNOWN / UNTRACKED_KEY / USER_LOCAL / USER_PKG / LOCAL_BUILD / APPIMAGE:
 
 Trusted processes that trip suspicious signals (e.g., unusual network activity,
 deleted binaries, memfd execution) display "(Maybe Weird)".
+
+Round 2 process signal `anon_exec_region` (20 points, T1055.009): more than
+8 MB of anonymous executable memory in a process that shows no JIT evidence
+(browser, node, java, QML, Bun, wasm or JIT thread names, JIT libraries in its
+maps, or a JIT engine embedded in its executable).
 
 ## Files
 

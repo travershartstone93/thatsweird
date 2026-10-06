@@ -38,6 +38,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 import hashlib
+from datetime import datetime
 import time
 
 __version__ = "1.1.0"
@@ -1941,6 +1942,7 @@ def load_policy() -> Dict:
             "deleted_exe": 50,
             "stale_after_upgrade": 5,
             "memfd_exec": 60,
+            "anon_exec_region": 20,
             "repo_name_impersonation": 25,
             "elf_suspicious": 25,
             "random_name": 20,
@@ -2040,6 +2042,7 @@ SIGNAL_ATTACK: Dict[str, str] = {
     "deleted_exe": "T1070.004",
     "stale_after_upgrade": "",
     "memfd_exec": "T1620",
+    "anon_exec_region": "T1055.009",
     "repo_name_impersonation": "T1036",
     "elf_suspicious": "T1027",
     "random_name": "T1036",
@@ -5484,6 +5487,139 @@ def check_raw_ip_outbound(proc: ProcessInfo) -> int:
     return add_signal(proc, "raw_ip_outbound", "Outbound to public IP on a non-standard port: " + ", ".join(hits[:3]))
 
 
+# =============================================================================
+# Round 2 process signal: large anonymous executable regions
+# =============================================================================
+
+ANON_EXEC_LIMIT_BYTES = 8 * 1024 * 1024
+ANON_EXEC_JIT_NAMES = {
+    "firefox", "firefox-esr", "firefox-bin", "chrome", "chromium", "chromium-browser", "brave", "brave-browser",
+    "electron", "java", "node", "nodejs", "deno", "bun", "mono", "dotnet", "qemu", "wine", "wine64",
+    "wineserver", "plasmashell", "kwin", "kwin_wayland", "kwin_x11", "gjs", "luajit", "ollama", "llama-server",
+    "qmlscene", "qml", "plasmoidviewer", "Web Content", "WebExtensions", "Isolated Web Co", "vivaldi-bin",
+    "opera", "epiphany", "WebKitWebProces", "konqueror", "falkon", "code", "codium",
+}
+ANON_EXEC_JIT_LIBS = ("libLLVM", "libjit", "libtorch", "libonnxruntime", "libtvm", "libjaxlib", "numba",
+                      "libxla", "libtensorflow", "libmlir", "_jit", "libv8", "libnode", "libmozjs",
+                      "libjavascriptcore", "libQt6Qml", "libQt5Qml", "libgjs", "libluajit", "libmono",
+                      "libcoreclr", "libwine", "libggml", "libllama", "libcuda", "libnvidia", "libvulkan",
+                      "libGLX", "libEGL", "libgallium", "libdxcore", "libamdhip", "libffi")
+ANON_EXEC_SKIP_MAPS = ("[heap]", "[stack]", "[vdso]", "[vsyscall]", "[vvar]", "[vvar_vclock]")
+
+
+def anonymous_exec_bytes(pid: int) -> Tuple[Optional[int], bool]:
+    """(bytes of anonymous executable mappings, whether a known JIT library is mapped). None when maps is unreadable."""
+    try:
+        with open(proc_path(pid, "maps"), errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None, False
+    total = 0
+    jit = False
+    for line in lines:
+        parts = line.split(None, 5)
+        if len(parts) < 5:
+            continue
+        path = parts[5] if len(parts) > 5 else ""
+        if path and not path.startswith("[anon"):
+            if path.startswith("[") or path.startswith("/memfd:"):
+                continue
+            if any(hint in path for hint in ANON_EXEC_JIT_LIBS):
+                jit = True
+            continue
+        if "x" not in parts[1]:
+            continue
+        start, _, end = parts[0].partition("-")
+        try:
+            total += int(end, 16) - int(start, 16)
+        except ValueError:
+            continue
+    return total, jit
+
+
+ANON_EXEC_JIT_THREADS = ("JITWorker", "JSCWarmUp", "HeapHelper", "Bun Pool", "V8 DefaultWorke", "V8 Platform",
+                         "C1 CompilerThre", "C2 CompilerThre", "QQmlThread", "mono-", ".NET ", "JIT", "wasm",
+                         "cranelift", "LuaJIT", "node", "deno", "CompilerThread", "QtQmlThread", "js-helper",
+                         "SpiderMonkey", "IonMonkey", "JS Helper", "Chrome_", "ThreadPoolForeg")
+
+
+ANON_EXEC_JIT_MARKERS = (b"wasm_store", b"wasmtime", b"cranelift", b"JavaScriptCore", b"v8::internal",
+                         b"LuaJIT", b"libgccjit", b"mono_jit", b"wasm3", b"wasmer", b"sljit", b"libffi",
+                         b"Bun.", b"JIT compiler", b"hotspot")
+_exe_jit_cache: Dict[str, bool] = {}
+
+
+def exe_jit_evidence(path: str) -> bool:
+    """Whether the executable itself embeds a JIT or wasm engine (tree-sitter wasm, Bun, LuaJIT ...).
+    Read once per path, in chunks, only when a process would otherwise be flagged."""
+    path = (path or "").replace(" (deleted)", "")
+    if not path or not path.startswith("/"):
+        return False
+    if path in _exe_jit_cache:
+        return _exe_jit_cache[path]
+    found = False
+    try:
+        with open(sys_path(path), "rb") as f:
+            tail = b""
+            while True:
+                chunk = f.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                window = tail + chunk
+                if any(marker in window for marker in ANON_EXEC_JIT_MARKERS):
+                    found = True
+                    break
+                tail = chunk[-64:]
+    except OSError:
+        found = False
+    _exe_jit_cache[path] = found
+    return found
+
+
+def jit_thread_evidence(pid: int) -> bool:
+    """A JIT runtime announces itself in its thread names (JSC, V8, HotSpot, QML, Mono, .NET)."""
+    try:
+        tids = os.listdir(proc_path(pid, "task"))
+    except OSError:
+        return False
+    for tid in tids:
+        try:
+            with open(proc_path(pid, "task", tid, "comm")) as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        if any(hint in comm for hint in ANON_EXEC_JIT_THREADS):
+            return True
+    return False
+
+
+def anon_exec_allowlisted(proc: ProcessInfo, jit_lib: bool) -> bool:
+    path = proc.path or ""
+    exe_name = os.path.basename(path.replace(" (deleted)", ""))
+    for name in (proc.name, exe_name):
+        if name in ANON_EXEC_JIT_NAMES or name in JIT_HEAVY_PROCESSES:
+            return True
+        if name.startswith(("java", "node", "qemu-", "wine")):
+            return True
+    if jit_lib or jit_thread_evidence(proc.pid) or exe_jit_evidence(path):
+        return True
+    name = proc.name
+    if "electron" in path.lower() or re.match(r"^/usr/lib/[^/]*/electron", path):
+        return True
+    if "memfd_exec" in proc.signal_keys:
+        return True
+    return False
+
+
+def anon_exec_signal(proc: ProcessInfo) -> int:
+    """Signal when a process carries more than 8 MB of anonymous executable memory without a JIT excuse."""
+    total, jit_lib = anonymous_exec_bytes(proc.pid)
+    if total is None or total <= ANON_EXEC_LIMIT_BYTES or anon_exec_allowlisted(proc, jit_lib):
+        return 0
+    return add_signal(proc, "anon_exec_region", f"{total // (1024 * 1024)} MB of anonymous executable memory "
+                      "and no JIT runtime to explain it")
+
+
 def calculate_weirdness_score(proc: ProcessInfo, user_trusted: Set[str]) -> int:
     """Calculate weirdness score for a process."""
     score = 0
@@ -5515,6 +5651,7 @@ def calculate_weirdness_score(proc: ProcessInfo, user_trusted: Set[str]) -> int:
         score += add_signal(proc, "memfd_exec", "CRITICAL: Executing from memory (memfd/anonymous)")
         for ev in proc.memfd_evidence:
             proc.evidence.append(f"  - {ev}")
+    score += anon_exec_signal(proc)
 
     # === MEDIUM SEVERITY: local build wearing a repository package name ===
     if proc.provenance.repo_name_clash:
@@ -7865,6 +8002,226 @@ PERSIST_COLLECTORS = (
 )
 
 
+# =============================================================================
+# Round 2 persistence checks: PATH shadowing, SSH footholds, restart loops
+# =============================================================================
+
+PATH_SHADOW_WATCHLIST = ("sudo", "su", "ssh", "scp", "git", "pacman", "passwd", "doas", "gpg", "curl",
+                         "wget", "python3", "bash", "ls", "cat", "systemctl")
+PATH_SHADOW_SYSTEM_DIRS = ("/usr/bin", "/usr/sbin", "/bin", "/sbin")
+SSH_KEY_RISKY_OPTIONS = ("agent-forwarding", "port-forwarding", "permitopen", "tunnel")
+SSH_CONFIG_COMMAND_KEYS = ("proxycommand", "localcommand", "permitlocalcommand", "remotecommand")
+RESTART_LOOP_MAX_SEC = 60
+
+
+def user_writable_dir(path: str) -> bool:
+    """A directory the current user can write to (own home, temp dirs, or world writable)."""
+    try:
+        st = os.stat(persist_host_path(path))
+    except OSError:
+        return False
+    if under_home(path) or in_temp_dir(path):
+        return True
+    return bool(st.st_mode & 0o002) or (st.st_uid == os.getuid() and os.getuid() != 0)
+
+
+def path_shadow_dirs() -> List[str]:
+    """User-writable directories on PATH plus the usual personal bin dirs."""
+    home = persist_home()
+    candidates = [home + "/.local/bin", home + "/bin"]
+    for entry in (os.environ.get("PATH") or "").split(":"):
+        entry = persist_expand_home(entry.strip())
+        if entry and entry not in candidates:
+            candidates.append(entry)
+    out = []
+    for d in candidates:
+        if d in out or d in PATH_SHADOW_SYSTEM_DIRS or not os.path.isdir(persist_host_path(d)):
+            continue
+        if under_home(d) or in_temp_dir(d) or user_writable_dir(d):
+            out.append(d)
+    return out
+
+
+def system_binary_for(name: str) -> Optional[str]:
+    for d in PATH_SHADOW_SYSTEM_DIRS:
+        candidate = d + "/" + name
+        if os.path.exists(sys_path(candidate)):
+            return candidate
+    return None
+
+
+def persist_path_shadow_entries() -> List[PersistEntry]:
+    """Files in user-writable PATH dirs that carry the name of a system binary on the watchlist."""
+    entries = []
+    for d in path_shadow_dirs():
+        try:
+            names = sorted(os.listdir(persist_host_path(d)))
+        except OSError:
+            continue
+        for name in names:
+            if name not in PATH_SHADOW_WATCHLIST:
+                continue
+            system = system_binary_for(name)
+            if system is None:
+                continue
+            path = d + "/" + name
+            host = persist_host_path(path)
+            real = os.path.realpath(host)
+            system_real = os.path.realpath(sys_path(system))
+            entry = PersistEntry("path shadow", path, name, path, target=path, attack="T1036.005")
+            if os.path.islink(host) and real == system_real:
+                entry.trust, entry.severity = "OFFICIAL", "info"
+                entry.provenance = f"symlink to {system}"
+            else:
+                entry.trust, entry.severity = "UNKNOWN", "critical"
+                entry.provenance = f"shadows {system} on PATH"
+            entries.append(entry)
+    return entries
+
+
+def ssh_path_suspicious(path: str) -> bool:
+    path = persist_expand_home(path)
+    if in_temp_dir(path):
+        return True
+    host = persist_host_path(path)
+    if not os.path.exists(host):
+        return True
+    if under_home(path):
+        return True
+    file_package_cache.build()
+    return pacman_owner(path) is None
+
+
+def parse_authorized_key(line: str) -> Optional[Tuple[str, str, str]]:
+    """(options, key type, comment) for one authorized_keys line; None for blanks and comments."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    m = re.match(r"^(?:(.*?)\s+)?((?:ssh|ecdsa|sk-)[\w@.-]+)\s+(\S+)(?:\s+(.*))?$", line)
+    if not m:
+        return None
+    return (m.group(1) or "", m.group(2), (m.group(4) or "").strip())
+
+
+def persist_ssh_foothold_entries() -> List[PersistEntry]:
+    """authorized_keys entries with forced commands, forwarding options, wildcard from= or no comment,
+    and ssh config commands that point at unowned or temp paths."""
+    entries = []
+    home = persist_home()
+    for name in ("authorized_keys", "authorized_keys2"):
+        path = f"{home}/.ssh/{name}"
+        lines = persist_read_lines(path)
+        if lines is None:
+            if os.path.exists(os.path.dirname(path)) and os.path.exists(path):
+                entries.append(PersistEntry("ssh key", path, name, "", trust="UNKNOWN",
+                                            provenance="unavailable (unreadable)", attack="T1098.004"))
+            continue
+        for number, line in enumerate(lines, 1):
+            parsed = parse_authorized_key(line)
+            if parsed is None:
+                continue
+            options, keytype, comment = parsed
+            notes, severity = [], ""
+            opts = options.lower()
+            m = re.search(r'command="([^"]*)"', options)
+            if m:
+                command = m.group(1)
+                target = command.split()[0] if command.split() else ""
+                if target and ssh_path_suspicious(target):
+                    severity = "critical"
+                    notes.append(f"forced command {command} runs from an unowned or temporary path")
+                else:
+                    severity = severity or "medium"
+                    notes.append(f"forced command {command}")
+            if any(o in opts for o in SSH_KEY_RISKY_OPTIONS):
+                severity = severity or "medium"
+                notes.append("forwarding or tunnel option set")
+            m = re.search(r'from="([^"]*)"', options)
+            if m and ("*" in m.group(1) or "?" in m.group(1)):
+                severity = severity or "medium"
+                notes.append(f"from={m.group(1)} is a wildcard")
+            if not comment:
+                severity = severity or "medium"
+                notes.append("key has no comment, owner unknown")
+            if not severity:
+                continue
+            entries.append(PersistEntry("ssh key", path, f"line {number} ({keytype})", line.strip()[:80],
+                                        target="", trust="UNKNOWN", provenance=", ".join(notes),
+                                        severity=severity, attack="T1098.004"))
+    config = f"{home}/.ssh/config"
+    for number, line in enumerate(persist_read_lines(config) or [], 1):
+        parts = line.strip().replace("=", " ", 1).split(None, 1)
+        if len(parts) < 2 or parts[0].lower() not in SSH_CONFIG_COMMAND_KEYS:
+            continue
+        key, value = parts[0], parts[1].strip()
+        if key.lower() == "permitlocalcommand":
+            if value.lower() == "yes":
+                entries.append(PersistEntry("ssh config", config, f"line {number} {key}", value, trust="UNKNOWN",
+                                            provenance="LocalCommand allowed", severity="medium", attack="T1098.004"))
+            continue
+        words = shlex.split(value) if value else []
+        target = words[0] if words else ""
+        if target and ("/" in target) and ssh_path_suspicious(target):
+            entries.append(PersistEntry("ssh config", config, f"line {number} {key}", value, target=target,
+                                        trust="UNKNOWN", provenance="command from an unowned or temporary path",
+                                        severity="medium", attack="T1098.004"))
+    return entries
+
+
+def unit_restart_loop(unit_file: str) -> Optional[str]:
+    """'Restart=always every 5s' when the unit restarts itself quickly, else None."""
+    restart, restart_sec = "", "0"
+    for section, key, value in parse_ini_lines(unit_file) or []:
+        if section != "Service":
+            continue
+        if key == "Restart":
+            restart = value.strip().lower()
+        elif key == "RestartSec":
+            restart_sec = value.strip()
+    if restart not in ("always", "on-failure"):
+        return None
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(ms|msec|s|sec|seconds?|min|m|minutes?|h|hours?)?$", restart_sec)
+    if not m:
+        return None
+    seconds = float(m.group(1))
+    unit = m.group(2) or "s"
+    if unit.startswith("m") and unit not in ("ms", "msec"):
+        seconds *= 60
+    elif unit.startswith("h"):
+        seconds *= 3600
+    elif unit in ("ms", "msec"):
+        seconds /= 1000
+    if seconds >= RESTART_LOOP_MAX_SEC:
+        return None
+    return f"Restart={restart} every {restart_sec or '0'}s"
+
+
+def persist_apply_restart_loops(entries: List[PersistEntry]) -> None:
+    """Raise systemd entries one severity step when a quick restart loop keeps a non-package target alive."""
+    for entry in entries:
+        if not entry.source.startswith("systemd") or entry.severity == "critical":
+            continue
+        if entry.trust not in ("UNKNOWN", "USER_LOCAL") and not in_temp_dir(entry.target or ""):
+            continue
+        loop = unit_restart_loop(entry.file)
+        if loop is None:
+            continue
+        entry.severity = "critical" if entry.severity == "medium" else "medium"
+        entry.provenance = f"{entry.provenance}, restart loop keeps it alive ({loop})"
+        entry.attack = "T1543.002"
+
+
+PERSIST_EXTRA_COLLECTORS = (persist_path_shadow_entries, persist_ssh_foothold_entries)
+
+
+def persist_extra_entries() -> List[PersistEntry]:
+    """Entries whose severity is decided by their own collector, not by target provenance."""
+    entries: List[PersistEntry] = []
+    for collector in PERSIST_EXTRA_COLLECTORS:
+        entries += collector()
+    return entries
+
+
 def collect_persistence() -> List[PersistEntry]:
     """Every persistence entry with its target assessed, critical first."""
     file_package_cache.build()
@@ -7873,6 +8230,8 @@ def collect_persistence() -> List[PersistEntry]:
         entries += collector()
     for entry in entries:
         assess_persist_entry(entry)
+    persist_apply_restart_loops(entries)
+    entries += persist_extra_entries()
     entries.sort(key=lambda e: (PERSIST_SEVERITY_ORDER[e.severity], e.source, e.file, e.key))
     return entries
 
@@ -8274,7 +8633,18 @@ def find_hidden_pids(listed: Optional[Set[int]] = None) -> List[Dict]:
         listed = list_pids_readdir()
     hidden = []
     for pid in range(1, read_pid_max() + 1):
-        if pid in listed or not probe_pid(pid):
+        if pid in listed:
+            if getpgid_probe(pid) is False and pid_interface_mismatch(pid) == "proc only":
+                hidden.append({"pid": pid, "name": _get_process_name(pid) or "?", "ppid": status_int(pid, "PPid"),
+                               "uid": status_int(pid, "Uid"), "mismatch": "proc only"})
+            continue
+        if not probe_pid(pid):
+            if getpgid_probe(pid) and pid_interface_mismatch(pid) == "getpgid only":
+                hidden.append({"pid": pid, "name": "?", "ppid": None, "uid": None, "mismatch": "getpgid only"})
+            continue
+        if pid_interface_mismatch(pid) == "proc only":
+            hidden.append({"pid": pid, "name": _get_process_name(pid) or "?", "ppid": status_int(pid, "PPid"),
+                           "uid": status_int(pid, "Uid"), "mismatch": "proc only"})
             continue
         tgid = status_int(pid, "Tgid")
         if tgid is not None and tgid != pid:
@@ -8397,6 +8767,70 @@ def loadavg_finding(counted: int, before: Optional[int], after: Optional[int]) -
                    f"{counted} threads counted across the listed pids", "low", "T1564.001")
 
 
+# =============================================================================
+# Round 2 hidden checks: bind mounts over /proc, second pid interface
+# =============================================================================
+
+def read_mountinfo() -> Optional[List[Tuple[str, str]]]:
+    """(mount point, filesystem type) rows from /proc/self/mountinfo."""
+    try:
+        with open(proc_path("self", "mountinfo")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    rows = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 7 or "-" not in parts:
+            continue
+        point = parts[4].replace("\\040", " ")
+        tail = parts[parts.index("-") + 1:]
+        rows.append((point, tail[0] if tail else "?"))
+    return rows
+
+
+def proc_mount_findings() -> List[Finding]:
+    """Mounts placed over /proc/<pid> hide that pid from every /proc reader; a non-proc mount on /proc hides everything."""
+    rows = read_mountinfo()
+    if rows is None:
+        return [Finding("proc mounts", "mountinfo unavailable", "info")]
+    findings = []
+    for point, fstype in rows:
+        if point == "/proc" and fstype != "proc":
+            findings.append(Finding("proc mounts", f"/proc is mounted as {fstype}, not proc: the process table "
+                                    "is a substitute", "critical", "T1564"))
+        m = re.match(r"^/proc/(\d+)(/.*)?$", point)
+        if m:
+            findings.append(Finding("proc mounts", f"{fstype} mount over {point}: hides pid {m.group(1)} "
+                                    "from every /proc reader", "critical", "T1564"))
+    return findings
+
+
+def getpgid_probe(pid: int) -> Optional[bool]:
+    """Whether the kernel knows the pid, asked through getpgid instead of /proc. None on a replayed tree."""
+    if PROC_ROOT != "/proc":
+        return None
+    try:
+        os.getpgid(pid)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
+def pid_interface_mismatch(pid: int) -> Optional[str]:
+    """'proc only' or 'getpgid only' when /proc and getpgid disagree twice in a row, else None."""
+    for _ in range(2):
+        in_proc = probe_pid(pid)
+        in_kernel = getpgid_probe(pid)
+        if in_kernel is None or in_proc == in_kernel:
+            return None
+    return "proc only" if in_proc else "getpgid only"
+
+
 def cmd_hidden(args) -> int:
     """Cross-view checks for hidden processes, threads and sockets."""
     started = time.monotonic()
@@ -8406,7 +8840,10 @@ def cmd_hidden(args) -> int:
     load_before = read_loadavg_tasks()
     hidden = find_hidden_pids(listed)
     findings = [Finding("hidden pid", f"pid {h['pid']} ({h['name']}): present in /proc but absent from "
-                        "the directory listing", "critical", "T1564.001") for h in hidden]
+                        "the directory listing", "critical", "T1564.001") for h in hidden if not h.get("mismatch")]
+    findings += [Finding("hidden pid", f"pid {h['pid']} ({h['name']}): visible to one kernel interface but not "
+                         f"the other ({h['mismatch']})", "critical", "T1564.001") for h in hidden if h.get("mismatch")]
+    findings += proc_mount_findings()
     if PROC_ROOT == "/proc":
         findings += socket_view_findings()
     else:
@@ -8742,11 +9179,140 @@ def sensor_row(posture: Dict[str, str]) -> str:
 
 
 def posture_findings(posture: Dict[str, str]) -> List[Finding]:
+    _, findings = helper_posture()
     if posture["module_loading"] == "open" and posture["lkrg"] == "not present":
-        return [Finding("hardening", "module loading is open and LKRG is not present: enforce signed modules "
+        return findings + [Finding("hardening", "module loading is open and LKRG is not present: enforce signed modules "
                         "(module.sig_enforce=1 or lockdown=integrity) or install LKRG to detect kernel "
                         "modifications at runtime", "info")]
-    return []
+    return findings
+
+
+# =============================================================================
+# Round 2 kernel checks: core_pattern, modprobe helper, kernel command line
+# =============================================================================
+
+CORE_HANDLERS_KNOWN = ("/usr/lib/systemd/systemd-coredump", "/lib/systemd/systemd-coredump",
+                       "/usr/share/apport/apport", "/usr/lib/apport/apport")
+MODPROBE_HELPERS_KNOWN = ("/sbin/modprobe", "/usr/sbin/modprobe", "/usr/bin/modprobe", "/usr/bin/kmod",
+                          "/bin/kmod", "/sbin/kmod")
+INIT_PATHS_KNOWN = ("/sbin/init", "/usr/lib/systemd/systemd", "/lib/systemd/systemd", "/bin/init",
+                    "/usr/bin/init", "/init", "/bin/systemd", "/usr/sbin/init")
+
+
+def handler_path_bad(path: str) -> Optional[str]:
+    """Why a kernel helper path is unsafe: temp dir, missing, user writable or unowned. None when fine."""
+    if not path or not path.startswith("/"):
+        return "not an absolute path"
+    if in_temp_dir(path):
+        return "in a temporary directory"
+    host = sys_path(path)
+    if not os.path.exists(host):
+        return "path does not exist"
+    try:
+        st = os.stat(host)
+        if st.st_mode & 0o002 or (SYSROOT == "/" and st.st_uid != 0 and st.st_uid == os.getuid()):
+            return "user writable"
+    except OSError:
+        return "unreadable"
+    file_package_cache.build()
+    if pacman_owner(path) is None and os.path.realpath(host) in (os.path.realpath(sys_path(p))
+                                                                for p in CORE_HANDLERS_KNOWN + MODPROBE_HELPERS_KNOWN):
+        return None
+    if pacman_owner(path) is None:
+        return "not owned by any package"
+    return None
+
+
+def core_pattern_state() -> Tuple[str, Optional[Finding]]:
+    value = read_sysctl("core_pattern")
+    if value is None:
+        return "unavailable", None
+    if not value.startswith("|"):
+        return f"file {value}" if value else "disabled", None
+    handler = value[1:].split()[0] if value[1:].split() else ""
+    if handler in CORE_HANDLERS_KNOWN or os.path.realpath(sys_path(handler)) in CORE_HANDLERS_KNOWN:
+        return f"piped to {handler}", None
+    why = handler_path_bad(handler)
+    if why is None:
+        return f"piped to {handler}", Finding("core dump handler", f"core_pattern pipes crashes to {handler}, "
+                                               "which is not a known coredump helper", "info", "T1546")
+    return f"piped to {handler} ({why})", Finding("core dump handler", f"core_pattern pipes every crash into "
+                                                   f"{handler}: {why}; the kernel runs it as root",
+                                                   "critical", "T1546")
+
+
+def modprobe_state() -> Tuple[str, Optional[Finding]]:
+    value = read_sysctl("modprobe")
+    if value is None:
+        return "unavailable", None
+    helper = value.strip()
+    why = handler_path_bad(helper)
+    if why is None:
+        return helper, None
+    return f"{helper} ({why})", Finding("modprobe helper", f"kernel.modprobe is {helper}: {why}; the kernel runs "
+                                        "it as root whenever a module is requested", "critical", "T1547.006")
+
+
+def read_kernel_cmdline() -> Optional[str]:
+    try:
+        with open(proc_path("cmdline")) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def cmdline_posture(cmdline: Optional[str]) -> Tuple[Dict[str, str], List[Finding]]:
+    """Posture rows and findings from the kernel command line."""
+    rows: Dict[str, str] = {}
+    findings: List[Finding] = []
+    if cmdline is None:
+        rows["cmdline"] = "unavailable"
+        return rows, findings
+    params = cmdline.split()
+    values = {}
+    for p in params:
+        key, _, value = p.partition("=")
+        values[key] = value
+    notes = []
+    if values.get("audit") == "0":
+        notes.append("audit=0")
+        findings.append(Finding("kernel cmdline", "audit=0 on the command line: the audit subsystem is off",
+                                "medium", "T1562.001"))
+    if "ima_policy" not in values:
+        notes.append("no IMA")
+        findings.append(Finding("kernel cmdline", "IMA not enabled (no ima_policy=)", "info"))
+    init = values.get("init")
+    if init and init not in INIT_PATHS_KNOWN:
+        notes.append(f"init={init}")
+        findings.append(Finding("kernel cmdline", f"init={init} is not a standard init path", "medium", "T1037"))
+    if "nokaslr" in values:
+        notes.append("nokaslr")
+        findings.append(Finding("kernel cmdline", "nokaslr: kernel address randomisation is off", "info"))
+    if values.get("module.sig_enforce") == "1":
+        notes.append("module.sig_enforce=1")
+        findings.append(Finding("kernel cmdline", "module.sig_enforce=1: only signed modules load", "info"))
+    if values.get("lockdown") in (None, "none"):
+        notes.append("no lockdown")
+    rows["cmdline"] = ", ".join(notes) if notes else "nothing notable"
+    return rows, findings
+
+
+def helper_posture() -> Tuple[Dict[str, str], List[Finding]]:
+    """core_pattern, modprobe and cmdline rows with their findings, for kernel_posture and posture_findings."""
+    rows: Dict[str, str] = {}
+    findings: List[Finding] = []
+    core_row, core_finding = core_pattern_state()
+    rows["core_pattern"] = core_row
+    if core_finding:
+        findings.append(core_finding)
+    modprobe_row, modprobe_finding = modprobe_state()
+    rows["modprobe"] = modprobe_row
+    if modprobe_finding:
+        findings.append(modprobe_finding)
+    cmd_rows, cmd_findings = cmdline_posture(read_kernel_cmdline())
+    rows.update(cmd_rows)
+    findings += cmd_findings
+    return rows, findings
 
 
 def kernel_posture() -> Dict[str, str]:
@@ -8761,6 +9327,8 @@ def kernel_posture() -> Dict[str, str]:
         "lkrg": lkrg_state(),
         "sensor": sensor_state(),
     }
+    helper_rows, _ = helper_posture()
+    posture.update(helper_rows)
     hello = sensor_hello() if posture["sensor"] == "active" else None
     if hello:
         posture["sensor_version"] = str(hello.get("sensor", ""))
@@ -8816,6 +9384,9 @@ def cmd_kernel(args) -> int:
         ("kptr_restrict", posture["kptr_restrict"]),
         ("unprivileged_bpf_disabled", posture["unprivileged_bpf_disabled"]),
         ("yama ptrace_scope", posture["ptrace_scope"]),
+        ("core dumps", posture.get("core_pattern", "unavailable")),
+        ("modprobe helper", posture.get("modprobe", "unavailable")),
+        ("kernel cmdline", posture.get("cmdline", "unavailable")),
         ("LKRG", posture["lkrg"]),
         ("real-time sensor", sensor_row(posture)),
         ("taint", "unavailable" if taint is None else
@@ -9085,10 +9656,11 @@ def pkgbuild_git_findings(pkg: AurPackage, clone_dir: Path, pkgbuild_version: st
         else:
             findings.append(Finding("PKGBUILD modified after install", f"uncommitted local edits to PKGBUILD "
                                     f"({len(changed)} changed line(s))", "medium", "T1195.001", pkg.name))
-    if last <= pkg.installdate:
+    installed_at = pacman_history_install_time(pkg.name) or pkg.installdate
+    if last <= installed_at:
         return
     when = time.strftime("%Y-%m-%d", time.localtime(last))
-    installed = time.strftime("%Y-%m-%d", time.localtime(pkg.installdate))
+    installed = time.strftime("%Y-%m-%d", time.localtime(installed_at))
     before = run_command(["git", "-C", directory, "log", "-1", "--format=%H", f"--before=@{pkg.installdate}",
                           "--", "PKGBUILD"]) or ""
     summary = "no commit before the install date"
@@ -9153,11 +9725,219 @@ def check_aur_packages(pkgbuild_dir: Optional[str] = None, local_db_only: bool =
     return packages
 
 
+# =============================================================================
+# Round 2 AUR checks: pacman.log history and language-manager caches
+# =============================================================================
+
+PACMAN_LOG = "/var/log/pacman.log"
+PACMAN_LOG_LINE = re.compile(r"^\[([^\]]+)\] \[ALPM\] (installed|upgraded|removed|reinstalled|downgraded) (\S+) \((.*)\)$")
+AUR_BUILD_WINDOW_SECONDS = 30 * 60
+LANGUAGE_CACHE_DIRS = (
+    ("npm cache", "~/.npm/_cacache/index-v5"), ("npx cache", "~/.npm/_npx"),
+    ("bun cache", "~/.bun/install/cache"), ("pnpm cache", "~/.cache/pnpm"),
+    ("yarn cache", "~/.cache/yarn"), ("yarn berry cache", "~/.yarn/berry/cache"),
+    ("npm global", "~/.npm-global/lib/node_modules"), ("npm global", "~/.local/lib/node_modules"),
+    ("npm global", "/usr/local/lib/node_modules"),
+)
+_pacman_history_cache: Optional[List[Tuple[int, str, str, str]]] = None
+
+
+def parse_pacman_log_time(stamp: str) -> Optional[int]:
+    """Epoch seconds from '2024-03-01T10:22:11+0100' or the older '2016-01-01 10:22'."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M"):
+        try:
+            return int(datetime.strptime(stamp, fmt).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def pacman_log_files() -> List[str]:
+    base = sys_path(PACMAN_LOG)
+    rotated = sorted(glob.glob(base + ".*"), reverse=True)
+    return rotated + [base]
+
+
+def read_pacman_log_lines(path: str) -> List[str]:
+    try:
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt", errors="replace") as f:
+                return f.read().splitlines()
+        if path.endswith(".xz"):
+            import lzma
+            with lzma.open(path, "rt", errors="replace") as f:
+                return f.read().splitlines()
+        with open(path, errors="replace") as f:
+            return f.read().splitlines()
+    except (OSError, EOFError, ValueError):
+        return []
+
+
+def pacman_history() -> List[Tuple[int, str, str, str]]:
+    """(timestamp, action, package, version) for every ALPM install, upgrade and removal in pacman.log,
+    oldest first. Cached for the run; empty when the log is unreadable."""
+    global _pacman_history_cache
+    if _pacman_history_cache is not None:
+        return _pacman_history_cache
+    rows = []
+    for path in pacman_log_files():
+        for line in read_pacman_log_lines(path):
+            m = PACMAN_LOG_LINE.match(line)
+            if not m:
+                continue
+            ts = parse_pacman_log_time(m.group(1))
+            if ts is None:
+                continue
+            action = m.group(2)
+            version = m.group(4)
+            if action in ("upgraded", "downgraded") and " -> " in version:
+                version = version.split(" -> ")[-1]
+            rows.append((ts, action, m.group(3), version))
+    rows.sort(key=lambda r: r[0])
+    _pacman_history_cache = rows
+    return rows
+
+
+def pacman_history_install_time(package: str) -> Optional[int]:
+    """Most recent install or upgrade time of a package in pacman.log."""
+    last = None
+    for ts, action, name, _ in pacman_history():
+        if name == package and action != "removed":
+            last = ts
+    return last
+
+
+def foreign_installs_in_windows(windows: List[Tuple[int, int]],
+                                foreign: Optional[Set[str]] = None) -> List[Tuple[int, str, str, str]]:
+    """History rows for foreign (locally built) packages installed or upgraded inside any (start, end) window."""
+    if foreign is None:
+        foreign = {d.get("NAME", "") for d in pacman_local_descs()
+                   if not is_distro_packager(d.get("PACKAGER", ""))}
+    return [row for row in pacman_history()
+            if row[2] in foreign and row[1] != "removed" and any(s <= row[0] <= e for s, e in windows)]
+
+
+def installed_then_removed() -> List[Tuple[str, int, int]]:
+    """(package, installed at, removed at) for packages that came and went, info material."""
+    installed: Dict[str, int] = {}
+    out = []
+    for ts, action, name, _ in pacman_history():
+        if action == "installed":
+            installed[name] = ts
+        elif action == "removed" and name in installed:
+            out.append((name, installed.pop(name), ts))
+    return out
+
+
+def is_distro_packager(packager: str) -> bool:
+    return any(hint in packager.lower() for hint in PACMAN_DISTRO_PACKAGERS)
+
+
+NODE_ECOSYSTEM_HINTS = ("nodejs", "npm", "yarn", "pnpm", "bun", "node-gyp", "electron")
+
+
+def uses_node_ecosystem(desc: Dict[str, str]) -> bool:
+    """Whether a package's dependencies or its cached PKGBUILD mention a node package manager."""
+    text = "\n".join(desc.get(k, "") for k in ("DEPENDS", "MAKEDEPENDS", "OPTDEPENDS"))
+    if any(h in text for h in NODE_ECOSYSTEM_HINTS):
+        return True
+    try:
+        pkgbuild = find_pkgbuild(desc_to_aur_package(desc))
+        if pkgbuild is not None:
+            return any(h in pkgbuild.read_text(errors="replace") for h in NODE_ECOSYSTEM_HINTS)
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def aur_build_windows() -> List[Tuple[int, int, str]]:
+    """(start, end, package) for each foreign package install whose build plausibly ran a node package manager:
+    the 30 minutes before the install is where makepkg most likely fetched things."""
+    foreign = {d.get("NAME", ""): d for d in pacman_local_descs() if not is_distro_packager(d.get("PACKAGER", ""))}
+    node_users = {name for name, d in foreign.items() if uses_node_ecosystem(d)}
+    return [(ts - AUR_BUILD_WINDOW_SECONDS, ts, name) for ts, action, name, _ in pacman_history()
+            if name in node_users and action != "removed"]
+
+
+def npm_index_entries(index_dir: str) -> List[Tuple[str, int]]:
+    """(package name, time) from npm's _cacache index files (one JSON record per line after a hash)."""
+    out = []
+    for root, _, files in os.walk(index_dir):
+        for name in files:
+            try:
+                with open(os.path.join(root, name), errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                _, _, body = line.partition("\t")
+                try:
+                    rec = json.loads(body or line)
+                except ValueError:
+                    continue
+                key = str(rec.get("key", ""))
+                m = re.search(r"registry\.npmjs\.org/((?:@[^/]+/)?[^/]+)/-/", key) or \
+                    re.search(r"request-cache:https?://[^/]+/((?:@[^/]+/)?[^/?]+)$", key)
+                if m and rec.get("time"):
+                    out.append((m.group(1), int(rec["time"]) // 1000))
+    return out
+
+
+def cache_dir_entries(label: str, directory: str) -> List[Tuple[str, int]]:
+    """(name, mtime) per top-level entry of a package cache; npm's index is parsed for real package names."""
+    host = persist_host_path(directory)
+    if not os.path.isdir(host):
+        return []
+    if label == "npm cache":
+        return npm_index_entries(host)
+    out = []
+    try:
+        names = os.listdir(host)
+    except OSError:
+        return []
+    for name in names:
+        path = os.path.join(host, name)
+        try:
+            mtime = int(os.stat(path).st_mtime)
+        except OSError:
+            continue
+        if name.startswith("@") and os.path.isdir(path):
+            try:
+                for sub in os.listdir(path):
+                    out.append((f"{name}/{sub}", int(os.stat(os.path.join(path, sub)).st_mtime)))
+            except OSError:
+                continue
+        else:
+            out.append((name, mtime))
+    return out
+
+
+def language_cache_findings() -> List[Finding]:
+    """Packages a language manager fetched while an AUR package was being built."""
+    windows = aur_build_windows()
+    if not windows:
+        return []
+    findings = []
+    seen = set()
+    for label, directory in LANGUAGE_CACHE_DIRS:
+        directory = persist_expand_home(directory)
+        for name, when in cache_dir_entries(label, directory):
+            for start, end, aur_pkg in windows:
+                if start <= when <= end and (label, name, aur_pkg) not in seen:
+                    seen.add((label, name, aur_pkg))
+                    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(when))
+                    findings.append(Finding("package fetched during an AUR build",
+                                            f"{label}: {name} fetched {stamp} while {aur_pkg} was being built",
+                                            "medium", "T1195.001", aur_pkg))
+    return findings
+
+
 def cmd_aur(args) -> int:
     """Supply chain checks on the PKGBUILDs behind locally built (AUR) packages."""
     started = time.monotonic()
     packages = check_aur_packages(getattr(args, "pkgbuild_dir", None))
     findings = [f for pkg in packages for f in pkg.findings]
+    findings += language_cache_findings()
     sort_findings(findings)
     code = findings_exit_code(findings)
     emit_findings_outputs(args, "aur", findings, started)
