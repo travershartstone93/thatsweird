@@ -3,6 +3,52 @@
 The long form of what each subcommand reads, how it scores and what its JSON
 carries. The [README](../README.md) has the short version; [rules.md](rules.md)
 covers rules.toml and [events.md](events.md) the weird-sensor event stream.
+The sections below are the sections of one plain `weird` run; each is also a
+`weird dev` command on its own, which is what the examples show.
+
+## One run
+
+Plain `weird` runs, in order: the self-check lines (only when something is
+wrong), the process scan, AUR packages (foreign package list, known-bad
+cross-check, PKGBUILD analysis), persistence entries, kernel posture and
+findings, stale binaries (only when a process still runs a replaced file) and
+the hidden-process cross-views (the slow pid probe, last). One summary line
+counts findings by severity across every section and the exit status is 2 with
+any critical finding, 1 with any medium or warning one, 0 when clean and 3 when
+a collector failed (that section is reported as failed and the rest still
+prints).
+
+`--skip SECTION` leaves a section out (processes, aur, persist, kernel, stale,
+hidden; repeatable). `-v` shows every process, the info rows and the notes
+behind each finding. `--json` prints one object with a key per section plus
+"summary"; `--ndjson` is one line per process and covers the scan section only.
+`--journal` and `--prometheus PATH` apply to every section. `--offline SYSROOT`
+runs the live-media checks instead (below). `--no-prompt`, or WEIRD_NO_PROMPT in
+the environment, means weird never asks a question; the only question it has is
+whether to download the known-bad AUR list. `--proc-root DIR` and `--sysroot
+DIR` (or WEIRD_PROC_ROOT and WEIRD_SYSROOT) point every section at a recorded
+tree. `weird PID` and `weird PATH` inspect one process or file, `weird trust`
+and `weird untrust` manage the baseline, `weird watch` streams.
+
+### The dev commands
+
+Everything else is under `weird dev`, which keeps the single-section flags
+(`--all`, `--net`, `--include-listen`, `--enrich-net`, `--log-file`,
+`--raw-cmdline`, `--debug-log`):
+
+- `weird dev scan`: the process section alone, with the network flags.
+- `weird dev inspect PID`: what `weird PID` runs.
+- `weird dev trust NAME`: add a name to `user_trusted.txt` (the older
+  name-based list; `weird trust` pins a hash instead).
+- `weird dev rules show|init`: print the active rules or write the template.
+- `weird dev cache show|clear`: the file to package cache.
+- `weird dev watch`, `restart-needed`, `persist`, `hidden`, `kernel`, `aur`,
+  `self-check`, `offline SYSROOT`, `fixture record PID DIR` and
+  `baseline init|show|diff|trust|untrust`: the sections and tools described
+  below, run one at a time with their own flags.
+- `weird dev falco-rules`: print the Falco rules `weird watch --falco` loads.
+- `weird dev man`: show the manual page. `weird dev completions bash|fish`:
+  print a completion script generated from the command tree.
 
 ## Binary integrity
 
@@ -14,7 +60,7 @@ are read in-process, so no root and no package manager call is needed.
 
 By default only flagged processes (any score, deleted or memfd executable)
 are hashed. `--deep` also hashes every OFFICIAL and THIRD_PARTY process,
-which costs well under a second per hundred binaries (about 0.3 s for 88 on this machine). `weird inspect PID` always
+which costs well under a second per hundred binaries (about 0.3 s for 88 on this machine). `weird dev inspect PID` always
 verifies the inspected process and prints an `Integrity:` line.
 
 A mismatch is `integrity_modified` (+60, ATT&CK T1554) and the verdict is
@@ -33,8 +79,8 @@ not critical) instead of critical. Mapped libraries in `/proc/<pid>/maps`
 get the same treatment.
 
 ```bash
-weird restart-needed          # stale processes grouped by systemd unit
-weird restart-needed --json   # same, machine readable
+weird dev restart-needed          # stale processes grouped by systemd unit
+weird dev restart-needed --json   # same, machine readable
 ```
 
 Exit code is 1 when something should be restarted and 0 otherwise. Each group
@@ -42,7 +88,7 @@ comes with the matching `systemctl restart` or `systemctl --user restart` line.
 
 ## Persistence (what runs without you starting it)
 
-`weird persist` walks the places a Linux box starts programs on its own and
+`weird dev persist` walks the places a Linux box starts programs on its own and
 checks the provenance of what each one launches, with the same package
 database, signature and hash checks the scanner uses on running processes:
 
@@ -76,14 +122,14 @@ services, T1053.006 timers, T1053.003 cron, T1547.013 autostart, T1546.004 shell
 rc, T1574.006 ld.so.preload, T1546 udev and pacman hooks, T1195.001 makepkg.conf).
 
 ```bash
-weird persist          # critical and medium entries, then a count line
-weird persist --all    # also list the entries that check out
-weird persist --json   # {host, timestamp, entries, counts}
+weird dev persist          # critical and medium entries, then a count line
+weird dev persist --all    # also list the entries that check out
+weird dev persist --json   # {host, timestamp, entries, counts}
 ```
 
 Exit code is 2 with any critical entry, 1 with any medium one, 0 otherwise.
 
-Round 2 additions (no root needed):
+Three further sources, read without root:
 
 - PATH shadowing: a file in a user-writable PATH directory (also ~/.local/bin
   and ~/bin) named like a watched system binary (sudo, su, ssh, git, pacman,
@@ -99,7 +145,7 @@ Round 2 additions (no root needed):
 ## Hidden processes, threads and sockets
 
 A rootkit that filters the /proc directory listing hides a process from ps,
-top and from weird's own scan. `weird hidden` reads the same facts through
+top and from weird's own scan. `weird dev hidden` reads the same facts through
 two paths each and reports every disagreement:
 
 - pids: the directory listing of /proc against a direct `stat` of
@@ -121,15 +167,15 @@ The full probe is about seven seconds on a 4194304 pid_max system, most of
 it inside the kernel.
 
 ```bash
-weird hidden           # findings table with an explanation under each row
-weird hidden --json    # {host, timestamp, self_check, pid_max, listed_pids, hidden_pids, findings, counts}
+weird dev hidden           # findings table with an explanation under each row
+weird dev hidden --json    # {host, timestamp, self_check, pid_max, listed_pids, hidden_pids, findings, counts}
 ```
 
 Exit code is 2 with any critical finding, 1 with any medium one, 0 otherwise.
 
 ### Self-check
 
-`weird`, `weird hidden` and `weird persist` start by looking at their own
+`weird`, `weird dev hidden` and `weird dev persist` start by looking at their own
 process: a non-empty /etc/ld.so.preload, LD_PRELOAD or LD_AUDIT in the
 environment, or an executable mapping in /proc/self/maps that no package owns
 (outside the interpreter's own prefix) prints a yellow warning before any
@@ -147,11 +193,11 @@ that refused to run would hide the tampering. No pin at all is reported as
 "integrity pin not found" without a warning.
 
 ```bash
-weird self-check                # self-check items, integrity result, both hashes
+weird dev self-check                # self-check items, integrity result, both hashes
 python3 scripts/update-pin.py   # after an intended change: record the new hash
 ```
 
-Round 2 additions: /proc/self/mountinfo is checked for mounts placed over
+Two more views. /proc/self/mountinfo is checked for mounts placed over
 /proc/<pid> (the way old rootkits hid pids) and for a /proc that is not of
 type proc [T1564]; every pid is also asked for through getpgid(), and a pid
 that one kernel interface knows and the other does not is reported after a
@@ -159,7 +205,7 @@ second check [T1564.001]. The getpgid probe is skipped on replayed trees.
 
 ## Kernel and modules
 
-`weird kernel` looks at the running kernel from the side a rootkit has to
+`weird dev kernel` looks at the running kernel from the side a rootkit has to
 hide from:
 
 - loaded modules across three views: /proc/modules, /sys/module (entries with
@@ -193,13 +239,13 @@ is open and LKRG is not present, an info finding recommends signed-module
 enforcement (module.sig_enforce=1 or lockdown=integrity) or LKRG.
 
 ```bash
-weird kernel           # posture block, then findings
-weird kernel --json    # {host, timestamp, modules, posture, findings, counts}
+weird dev kernel           # posture block, then findings
+weird dev kernel --json    # {host, timestamp, modules, posture, findings, counts}
 ```
 
 Exit code is 2 with any critical finding, 1 with any medium one, 0 otherwise.
 
-Round 2 posture rows: "core dumps" (kernel.core_pattern; a pipe to a handler
+The posture report also has the rows "core dumps" (kernel.core_pattern; a pipe to a handler
 in a temp dir, missing, user writable or unowned is critical [T1546]),
 "modprobe helper" (kernel.modprobe must be a packaged path, otherwise critical
 [T1547.006]) and "kernel cmdline" (audit=0 and a non-standard init= are
@@ -209,7 +255,7 @@ positive note).
 ## AUR supply chain
 
 Packages that did not come from an enabled repository were built locally from
-a PKGBUILD, and that PKGBUILD is the whole chain of trust. `weird aur` lists
+a PKGBUILD, and that PKGBUILD is the whole chain of trust. `weird dev aur` lists
 them (`pacman -Qm`, or the local database when pacman is not available:
 validation other than pgp or an unknown packager) and finds the PKGBUILD in
 ~/.cache/paru/clone/<name>, ~/.cache/yay/<name> or the directory given with
@@ -234,22 +280,15 @@ the checksum arrays and the `install=` line:
   removed) or has no clone is listed as info
 
 ```bash
-weird aur                      # critical, medium and low findings
-weird aur --all                # also the info entries
-weird aur --pkgbuild-dir DIR   # DIR/<name>/PKGBUILD checked first
-weird aur --json               # {host, timestamp, packages, findings, counts}
+weird dev aur                      # critical, medium and low findings
+weird dev aur --all                # also the info entries
+weird dev aur --pkgbuild-dir DIR   # DIR/<name>/PKGBUILD checked first
+weird dev aur --json               # {host, timestamp, packages, findings, counts}
 ```
 
 Exit code is 2 with any critical finding, 1 with any medium one, 0 otherwise.
 
-### Network inspection (what it actually does)
-
-weird does **not** sniff packet contents. It builds a process-to-socket view using:
-
-- `ss` (preferred) or `/proc/net` as a fallback
-- Outbound connections by default
-
-Round 2 additions: /var/log/pacman.log (plus rotated .gz/.xz copies) gives a
+/var/log/pacman.log (plus rotated .gz/.xz copies) gives a
 per-run install history (`pacman_history()`), used for the install time of
 the "PKGBUILD modified after install" check, for packages installed and later
 removed, and for foreign installs inside given time windows. Language manager
@@ -258,6 +297,35 @@ for packages fetched in the 30 minutes before an AUR package whose build uses
 npm, yarn, pnpm or bun was installed: "package fetched during an AUR build"
 (medium, T1195.001). Absent or unreadable caches are skipped.
 
+### Known-bad list
+
+Foreign package names are also matched against the campaign lists kept by
+[aur-malware-check](https://github.com/lenucksi/aur-malware-check)
+(campaigns.json plus the list files it names). Only ids, labels, date windows
+and package names are read; nothing in the file is executed. An installed
+package on a list is **critical** "known malicious AUR package" [T1195.002]
+with the campaign window and the install date from pacman.log; a name that is
+only present in the paru or yay cache is info. The list lives under
+`~/.config/weird/campaigns/` (0600) with a meta.json recording sha256, size and
+the newest campaign date, and the aur header shows its status.
+
+weird never downloads the list on its own. On a terminal, when no list is
+cached or it is older than `campaigns_max_age_days` (config.toml, default 7),
+it asks one [y/N] question and prints what it would fetch; Enter or EOF means
+no. It never asks without a terminal, under `--json` or `--ndjson`, in watch
+mode, on the timer (the shipped unit sets WEIRD_NO_PROMPT=1), or with
+`--no-prompt`. `weird dev aur --campaigns PATH` uses a file you supply and
+never fetches; `--fetch-campaigns` downloads without asking (https only, 20 s,
+5 MB, redirects away from github.com refused). A failed download prints one
+line and the run continues.
+
+### Network inspection (what it actually does)
+
+weird does **not** sniff packet contents. It builds a process-to-socket view using:
+
+- `ss` (preferred) or `/proc/net` as a fallback
+- Outbound connections by default
+
 ## Offline mode (live media)
 
 No user space tool defeats a kernel rootkit on the machine it owns. The one
@@ -265,13 +333,13 @@ mode whose answer is trustworthy by construction is to boot live media, mount
 the suspect disk and read it from a kernel the attacker does not control:
 
 ```bash
-weird offline /mnt/root              # persist + executable integrity + aur, no process scan
-weird offline /mnt/root --limit 500  # hash only the first 500 executables
-weird offline /mnt/root --json       # {sysroot, sections: {persist, integrity, aur}, findings, counts}
+weird dev offline /mnt/root              # persist + executable integrity + aur, no process scan
+weird dev offline /mnt/root --limit 500  # hash only the first 500 executables
+weird dev offline /mnt/root --json       # {sysroot, sections: {persist, integrity, aur}, findings, counts}
 ```
 
 `offline SYSROOT` sets the sysroot and runs three parts against the mounted
-disk: the persistence sweep (`weird persist` with every path under SYSROOT),
+disk: the persistence sweep (`weird dev persist` with every path under SYSROOT),
 integrity of every package-owned executable under SYSROOT/usr/bin and
 SYSROOT/usr/lib (pacman mtree or dpkg md5sums, a differing hash is
 **critical**, T1554; symlinks and unowned files are counted, not hashed) and
@@ -304,7 +372,7 @@ each container lookup.
 ## Fixtures (replaying a live process)
 
 ```bash
-weird fixture record 1234 /tmp/case          # capture PID 1234
+weird dev fixture record 1234 /tmp/case          # capture PID 1234
 weird --proc-root /tmp/case --sysroot /tmp/case/sysroot -v   # replay it anywhere
 ```
 
@@ -335,7 +403,7 @@ weird watch | jq -r '"\(.verdict) \(.name) pid \(.pid): \(.reasons[0])"'
 ```
 
 `weird watch --falco` keeps the old behaviour and runs Falco in the
-foreground with the weird rules (needs `/usr/bin/falco` and sudo).
+foreground with the weird dev rules (needs `/usr/bin/falco` and sudo).
 
 ### Real-time events from weird-sensor
 
@@ -384,7 +452,7 @@ weird watch --events /tmp/events.ndjson     # terminal 2 (add --follow: /tmp is 
 cp /usr/bin/sleep /tmp/sshd && /tmp/sshd 30 # terminal 3: the alert appears within the second
 ```
 
-`weird kernel` shows `real-time sensor: active (weird-sensor 0.1.0, schema
+`weird dev kernel` shows `real-time sensor: active (weird-sensor 0.1.0, schema
 v1)` while the file is fresh, reading the version from the hello line.
 
 ## Journal and Prometheus output
@@ -440,7 +508,7 @@ weird --journal; notify-send weird "$(journalctl -t weird -p warning -n 1 -o cat
 
 ## Baseline trust (a file integrity monitor for what you run)
 
-`weird baseline trust <pid|path>` records the executable's realpath,
+`weird dev baseline trust <pid|path>` records the executable's realpath,
 sha256, package and trust level in `~/.config/weird/trusted.json` (0600,
 written atomically, ignored if world-writable or owned by someone else,
 like the cache). From then on:
@@ -450,10 +518,10 @@ like the cache). From then on:
 - a process matching an entry by process key or path whose hash no longer
   matches is not suppressed and gets `trusted_binary_changed` (+30,
   ATT&CK T1554, "trusted binary changed since trust was recorded (date)");
-- `weird baseline diff` re-hashes every trusted file on disk and lists the
+- `weird dev baseline diff` re-hashes every trusted file on disk and lists the
   changed ones under `changed_hash`, whether or not they are running.
 
-`weird baseline untrust <path>` removes the entry.
+`weird dev baseline untrust <path>` removes the entry.
 
 ## Weirdness labels (untrusted classes)
 
@@ -468,7 +536,7 @@ For UNKNOWN / UNTRACKED_KEY / USER_LOCAL / USER_PKG / LOCAL_BUILD / APPIMAGE:
 Trusted processes that trip suspicious signals (e.g., unusual network activity,
 deleted binaries, memfd execution) display "(Maybe Weird)".
 
-Round 2 process signal `anon_exec_region` (20 points, T1055.009): more than
+The signal `anon_exec_region` (20 points, T1055.009) fires on more than
 8 MB of anonymous executable memory in a process that shows no JIT evidence
 (browser, node, java, QML, Bun, wasm or JIT thread names, JIT libraries in its
 maps, or a JIT engine embedded in its executable).
@@ -480,6 +548,7 @@ maps, or a JIT engine embedded in its executable).
 - `~/.config/weird/user_trusted.txt`: User trusted list
 - `~/.config/weird/cache/file_package_map.json`: File -> package cache
 - `~/.config/weird/baseline.json`: Baseline data
-- `~/.config/weird/trusted.json`: Trusted executable hashes (`weird baseline trust`)
+- `~/.config/weird/trusted.json`: Trusted executable hashes (`weird trust`)
+- `~/.config/weird/campaigns/`: known-bad AUR list (campaigns.json, the list files it names, meta.json), 0600
 - `package.json` (`weirdIntegrity`): sha256 pin of `bin/weird`, refreshed by `scripts/update-pin.py`
 - `systemd/weird.service`, `weird.timer`: scheduled daily run

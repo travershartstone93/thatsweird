@@ -42,7 +42,7 @@ import hashlib
 from datetime import datetime
 import time
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 # =============================================================================
@@ -9224,7 +9224,8 @@ def posture_findings(posture: Dict[str, str]) -> List[Finding]:
     if posture["module_loading"] == "open" and posture["lkrg"] == "not present":
         return findings + [Finding("hardening", "module loading is open and LKRG is not present: enforce signed modules "
                         "(module.sig_enforce=1 or lockdown=integrity) or install LKRG to detect kernel "
-                        "modifications at runtime", "info")]
+                        "modifications at runtime; for a one-off root check of the syscall table, ftrace "
+                        "and BPF objects run ghostscan (github.com/aidlx/ghostscan)", "info")]
     return findings
 
 
@@ -11223,7 +11224,7 @@ def build_parser(with_verbs: bool = False) -> argparse.ArgumentParser:
                         help="Live-media mode: check a mounted disk (no process or hidden sections)")
     parser.add_argument("--skip", action="append", default=[], choices=SECTIONS, metavar="SECTION",
                         help="Leave out a section (repeatable): " + ", ".join(SECTIONS))
-    parser.add_argument("--no-prompt", dest="no_prompt", action="store_true", help="Never ask questions (reserved)")
+    parser.add_argument("--no-prompt", dest="no_prompt", action="store_true", help="Never ask questions (the known-bad list fetch)")
     parser.add_argument("--proc-root", dest="proc_root", metavar="DIR", default=os.environ.get("WEIRD_PROC_ROOT"),
                         help="Read process info from DIR instead of /proc (replays, tests)")
     parser.add_argument("--sysroot", dest="sysroot", metavar="DIR", default=os.environ.get("WEIRD_SYSROOT"),

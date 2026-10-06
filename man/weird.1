@@ -1,6 +1,6 @@
-.TH WEIRD 1 "September 6, 2026" "weird 1.1.0" "User Commands"
+.TH WEIRD 1 "October 6, 2026" "weird 1.2.0" "User Commands"
 .SH NAME
-weird \- process anomaly detector for Linux
+weird \- one-command Linux host check without root
 .SH SYNOPSIS
 .B weird
 [\fB\-v\fR] [\fB\-\-deep\fR] [\fB\-\-json\fR | \fB\-\-ndjson\fR]
@@ -28,11 +28,14 @@ weird \- process anomaly detector for Linux
 \fB\-\-version\fR
 .SH DESCRIPTION
 .B weird
-scans running processes and highlights suspicious behavior and unclear provenance.
-It combines process inventory with package manager ownership, signature evidence,
-and behavioral signals to produce a weirdness score and trust label.
-The output is deterministic where possible (normalized cmdline, stable sorting)
-and can be emitted as JSON/NDJSON for automation.
+is one run, one report: a process scan, the AUR packages, persistence entries,
+kernel posture, stale binaries and hidden\-process cross\-views, with a summary
+line and one exit code (0 clean, 1 medium or warning, 2 critical, 3 a collector
+failed). It judges provenance from the distribution's own package data and the
+behaviour of each process from /proc, never asks for root, and can prove its
+own file has not changed. Trust levels mean provenance, not security. The
+output is deterministic where possible (normalized cmdline, stable sorting) and
+can be emitted as JSON/NDJSON for automation.
 .SH ARCHITECTURE
 Data flow (best effort, never hard-fails):
 .TP
@@ -74,7 +77,7 @@ official / third_party / verified / unverified / unknown. On pacman systems
 \fBverified\fR means the local database records a pgp check at install time.
 .PP
 Trust levels are mapped conservatively. APT with official keyring match -> OFFICIAL.
-APT signed-by non-distro -> THIRD_PARTY. Other managers only elevate if verification is explicit.
+APT signed-by non-distro -> THIRD_PARTY. Other managers only rise to OFFICIAL when verification is explicit.
 .SH SIGNATURE VERIFICATION
 .TP
 .B APT
@@ -179,7 +182,8 @@ collector failed. \fB\-\-skip\fR \fISECTION\fR leaves a section out (processes,
 aur, persist, kernel, stale, hidden; repeatable). \fB\-\-json\fR prints one object
 with a key per section plus "summary". \fB\-\-offline\fR \fISYSROOT\fR runs the
 live\-media checks (persist, integrity, aur) against a mounted disk with no process
-or hidden sections. \fB\-\-no\-prompt\fR is accepted and reserved.
+or hidden sections. \fB\-\-no\-prompt\fR never asks a question (today the
+only one is the known\-bad list download).
 .TP
 .B \fIPID\fR | \fIPATH\fR
 A number inspects that process (provenance, integrity, mappings, environment,
@@ -464,6 +468,18 @@ temporary file in the same directory and renamed into place. The shipped
 systemd/weird.service and weird.timer run a daily scan with \fB\-\-journal\fR and
 \fB\-\-prometheus\fR.
 .TP
+.B \-\-skip \fISECTION\fR
+Leave a section out of the default run: processes, aur, persist, kernel, stale
+or hidden. Repeatable.
+.TP
+.B \-\-offline \fISYSROOT\fR
+Live\-media mode: persist, executable integrity and aur against a mounted disk,
+with no process or hidden sections. Refuses / without \fB\-\-force\fR.
+.TP
+.B \-\-no\-prompt
+Never ask a question. The only question weird asks is whether to download the
+known\-bad AUR list; this flag, or WEIRD_NO_PROMPT in the environment, answers no.
+.TP
 .B \-\-log\-file \fIFILE\fR
 Append logs to a file (no secrets).
 .TP
@@ -560,21 +576,35 @@ Baseline data.
 .B ~/.config/weird/trusted.json
 Trusted executable hashes written by \fBweird baseline trust\fR (0600).
 .TP
+.B ~/.config/weird/campaigns/
+The known\-bad AUR list (campaigns.json and the list files it names) with
+meta.json (sha256, size, newest campaign date), 0600, fetched only after a yes.
+.TP
 .B systemd/weird.service, weird.timer
-Shipped user units for a daily scan and persistence check.
+Shipped user units for one daily full run.
+.SH ENVIRONMENT
+.TP
+.B WEIRD_NO_PROMPT
+When set, weird never asks a question (same as \fB\-\-no\-prompt\fR).
+.TP
+.B WEIRD_PROC_ROOT
+Directory read instead of /proc (same as \fB\-\-proc\-root\fR).
+.TP
+.B WEIRD_SYSROOT
+Prefix for package databases and system configuration (same as \fB\-\-sysroot\fR).
 .SH EXIT STATUS
 .TP
 .B 0
-No alerts above threshold.
+Nothing found above info.
 .TP
 .B 1
-Warning.
+At least one medium or warning finding.
 .TP
 .B 2
-Critical.
+At least one critical finding.
 .TP
 .B 3
-Internal error / partial failure.
+A collector failed or an internal error; the report may be partial.
 .SH SECURITY NOTES
 Trust indicates provenance only. Even OFFICIAL packages can be compromised.
 Use weird as part of defense\-in\-depth, not as your only security control.
