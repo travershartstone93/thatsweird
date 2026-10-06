@@ -49,12 +49,13 @@ weird 1234             # one process in depth: provenance, integrity, mappings, 
 weird /usr/bin/foo     # one file: owner package, integrity, which processes run it
 weird trust 1234       # pin that executable's hash; scans stay quiet until the file changes
 weird watch            # one NDJSON line per new flagged process
-weird --skip hidden    # leave a section out (repeatable); hidden is the slow pid probe
+weird --skip hidden    # leave a section out (repeatable); --deep probes every pid up to pid_max
 weird --offline /mnt/root   # live-media mode: check a mounted disk, no process sections
 ```
 
-Exit status: 0 clean, 1 medium or warning findings, 2 anything critical, 3 a
-collector failed. The report ends with a summary line of counts by severity.
+The report ends with "summary: N to look at (c critical, m medium, l low), M
+entries are your own unpackaged software, I info (exit E)"; only "to look at"
+sets the exit status: 0 clean, 1 medium or warning, 2 critical, 3 a collector failed.
 
 ## Commands
 
@@ -89,7 +90,9 @@ fetches without a terminal, under `--json`, `--ndjson` or `watch`, with
 ld.so.preload, udev, pacman hooks and makepkg.conf, each target checked for
 provenance; a binary in a user-writable PATH directory shadowing sudo, ssh,
 git or pacman; authorized_keys entries with forced commands or options;
-units that restart an unowned target in a tight loop.
+units that restart an unowned target in a tight loop. Your own scripts under
+your home, run by your own units and rc files, are "your own unpackaged
+software" (info) until a second signal appears.
 
 **Kernel posture.** Modules compared across /proc/modules, /sys/module and
 kallsyms, module file ownership, taint flags, Secure Boot, lockdown, module
@@ -101,9 +104,9 @@ audit, lockdown or IMA off.
 grouped by systemd unit with the restart line to run.
 
 **Hidden processes.** The /proc listing against two independent pid probes
-(stat on every pid up to pid_max, and getpgid on the same range), /proc/net
-against ss over netlink, thread counts against task directories, and bind
-mounts placed over /proc/PID directories to hide them.
+(stat and getpgid on every pid up to the last one assigned, or to pid_max with
+`--deep`), /proc/net against ss over netlink, thread counts against task
+directories, and bind mounts placed over /proc/PID directories to hide them.
 
 ## How it works
 
@@ -203,23 +206,21 @@ python3 -m unittest discover -s tests      # about 400 tests, around a minute
 Most tests build a fake /proc and a fake package database (Arch and Debian
 shaped) under `tests/.sandbox` and run the real code against them with
 `--proc-root` and `--sysroot`, so they pass on any distribution without
-root. The emulation tests in `tests/test_emulation.py` start harmless decoys
-on the host (a copy of sleep named sshd under /tmp, a deleted executable, a
-memfd exec, an LD_PRELOAD of a real library, a ptrace attach) and prove the
-live scan catches each one with the expected reason and ATT&CK id. `weird dev
-fixture record PID DIR` captures a real process into a tree the suite can
-replay, so a scenario seen once becomes a test without shipping anything
-dangerous. CI runs the suite on Ubuntu (Python 3.12 and 3.13) and in an Arch
-Linux container.
+root. `tests/test_emulation.py` starts harmless decoys on the host (a copy of
+sleep named sshd under /tmp, a deleted executable, a memfd exec, an LD_PRELOAD
+of a real library, a ptrace attach) and proves the live scan catches each one
+with its ATT&CK id. `weird dev fixture record PID DIR` captures a real process
+into a tree the suite can replay. CI runs the suite on Ubuntu (Python 3.12 and
+3.13) and in an Arch Linux container.
 
 ## How it compares
 
-[ghostscan](https://github.com/aidlx/ghostscan) runs as root and
-carries 52 kernel-level scanners, including syscall table, ftrace, kprobe and
-BPF checks, so it is better than weird at finding a kernel rootkit that is
-already in place. weird recommends it when module loading is open, and
-borrowed its unprivileged ideas: core_pattern and modprobe tampering, kernel
-command line flags, proc bind mounts and the second pid probe.
+[ghostscan](https://github.com/aidlx/ghostscan) runs as root with 52
+kernel-level scanners (syscall table, ftrace, kprobe and BPF checks), so it is
+better than weird at finding a kernel rootkit already in place. weird
+recommends it when module loading is open, and borrowed its unprivileged
+ideas: core_pattern and modprobe tampering, kernel command line flags, proc
+bind mounts and the second pid probe.
 
 [aur-malware-check](https://github.com/lenucksi/aur-malware-check) keeps the
 lists of packages named in known campaigns; weird consumes those lists with
@@ -230,15 +231,14 @@ Falco and Tetragon watch syscalls in real time through eBPF, need root and
 BPF programs, and know nothing about packages; weird is a user-space
 snapshot and provenance tool that exports Falco rules and consumes the
 weird-sensor stream when real time matters. rkhunter and chkrootkit match
-known rootkit signatures and file names; weird has no signature list and
-asks where each file came from. unhide finds hidden pids by the same readdir
-versus stat walk and stops there. needrestart tells you what to restart
-after an upgrade and is not in the official Arch repositories. osquery
-answers any question you can write as SQL; weird ships the questions. AIDE,
-debsums and `pacman -Qkk` check files on disk against a database; weird
-applies the package hashes to what is running and to what is set to run.
-Lynis audits hardening settings; the posture block of the kernel section
-overlaps with its kernel checks and nothing else.
+known rootkit signatures; weird has no signature list and asks where each
+file came from. unhide finds hidden pids by the same readdir versus stat walk
+and stops there. needrestart tells you what to restart after an upgrade and
+is not in the official Arch repositories. osquery answers any question you
+can write as SQL; weird ships the questions. AIDE, debsums and `pacman -Qkk`
+check files on disk against a database; weird applies the package hashes to
+what is running and to what is set to run. Lynis audits hardening settings;
+only the posture block of the kernel section overlaps with it.
 
 weird is a user-space tool, and a kernel rootkit that controls what /proc
 says can lie to it. The mitigations are the cross-view checks that compare

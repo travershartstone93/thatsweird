@@ -1,4 +1,4 @@
-.TH WEIRD 1 "October 6, 2026" "weird 1.2.0" "User Commands"
+.TH WEIRD 1 "October 6, 2026" "weird 1.3.0" "User Commands"
 .SH NAME
 weird \- one-command Linux host check without root
 .SH SYNOPSIS
@@ -175,10 +175,15 @@ Enable with \fB--debug-log FILE\fR or WEIRD_DEBUG_LOG to troubleshoot failures.
 One run, one report. Sections in order: self\-check lines when something is wrong,
 process scan, AUR packages (foreign package list, known\-bad cross\-check, PKGBUILD
 analysis), persistence entries, kernel posture and findings, stale binaries (only
-when a process still runs a replaced file), hidden process cross\-views (the slow
-pid probe). Ends with a summary line of counts by severity across every section.
-Exit status 2 if any critical, 1 if any medium or warning, 0 otherwise, 3 when a
-collector failed. \fB\-\-skip\fR \fISECTION\fR leaves a section out (processes,
+when a process still runs a replaced file), hidden process cross\-views (the pid
+probe). The AUR, persistence and kernel sections run in threads while the process
+scan runs; the output order never changes. A section with nothing to show prints
+its header and one "nothing to report" line; the full tables, posture rows, info
+notes and the security banner appear with \fB\-v\fR and in the single \fBdev\fR
+commands. Ends with one summary line: "N to look at (c critical, m medium, l low),
+M entries are your own unpackaged software, I info (exit E)". Only "to look at"
+sets the exit status: 2 if any critical, 1 if any medium or warning, 0 otherwise,
+3 when a collector failed. \fB\-\-skip\fR \fISECTION\fR leaves a section out (processes,
 aur, persist, kernel, stale, hidden; repeatable). \fB\-\-json\fR prints one object
 with a key per section plus "summary". \fB\-\-offline\fR \fISYSROOT\fR runs the
 live\-media checks (persist, integrity, aur) against a mounted disk with no process
@@ -262,16 +267,29 @@ differs from the package, or the entry lives under /tmp, /dev/shm or /var/tmp;
 \fBmedium\fR for inline scripts, USER_LOCAL or LOCAL_BUILD targets and shell
 rc hits; \fBinfo\fR otherwise. An inline script in a packaged unit or hook
 file that still matches its install hash is the distro's own and stays info.
-The table lists critical and medium entries and ends with a count line;
+The yours tier: a USER_LOCAL target under the user's own home, launched from a
+file that is also under the home (a user unit, ~/.bashrc, ~/.ssh/config), is
+\fBinfo\fR with the note "your own unpackaged software" and \fByours\fR true
+in the JSON. It is \fBmedium\fR with a second signal: the launching file is
+under /etc or /usr, a restart loop keeps it alive through an unpackaged
+interpreter, or a temp\-dir or integrity hit (critical). A unit under
+/etc/systemd/system pointing at an unpackaged file under /usr/local stays
+medium ("system\-wide persistence of unpackaged code").
+The table lists critical and medium entries and ends with a count line split
+into critical, medium, your own unpackaged software and info;
 \fB\-\-all\fR lists everything, \fB\-\-json\fR prints host, timestamp,
 entries (with the MITRE ATT&CK id per source) and counts. Exit status is 2
 with any critical entry, 1 with any medium one, 0 otherwise.
 .TP
 .B hidden
 Cross\-view checks for hidden processes, threads and sockets. Pids: the
-/proc directory listing against a direct stat of /proc/PID/stat for every pid
-from 1 to pid_max; a pid that answers but is not listed is \fBcritical\fR
-(T1564.001). Thread ids answer too, so a hit whose Tgid is another pid is a
+/proc directory listing against a direct stat of /proc/PID/stat and a getpgid()
+call for every pid from 1 up to the probe limit; a pid that answers but is not
+listed is \fBcritical\fR (T1564.001). The limit is the last pid the kernel
+assigned (the last field of /proc/loadavg) or the highest listed pid, plus a
+margin of 2000 or five percent: a hidden process is already running, so its
+pid is at or below that mark. \fB\-\-deep\fR sweeps every pid up to pid_max.
+Thread ids answer too, so a hit whose Tgid is another pid is a
 thread, and every hit is confirmed a second time so process churn is not
 reported. Sockets: inodes in /proc/net/{tcp,tcp6,udp,udp6} against
 \fBss \-tunapHe\fR (netlink); a socket only one side reports is
@@ -280,7 +298,7 @@ the Threads: line in status against the /proc/PID/task listing, re\-read to
 rule out a race (\fBmedium\fR). Totals: the task count in /proc/loadavg
 against the threads counted over the listing, with a margin (\fBlow\fR).
 Each row carries a one\-paragraph explanation. \fB\-\-json\fR prints host,
-timestamp, self_check, pid_max, listed_pids, hidden_pids, findings and counts.
+timestamp, self_check, pid_max, probed_to, listed_pids, hidden_pids, findings and counts.
 Exit status is 2 with any critical finding, 1 with any medium one, 0 otherwise.
 .IP
 \fBweird\fR, \fBweird hidden\fR and \fBweird persist\fR begin with a
@@ -442,7 +460,9 @@ Enable network enrichment (best effort).
 .TP
 .B \-\-deep
 Hash every OFFICIAL and THIRD_PARTY executable against its package, not only
-the flagged ones. Costs well under a second per hundred binaries.
+the flagged ones (well under a second per hundred binaries), and make the
+hidden section probe every pid up to pid_max instead of stopping a margin
+above the last pid assigned (about fifteen seconds on a 4194304 pid_max system).
 .TP
 .B \-\-json
 Output JSON.
@@ -595,7 +615,7 @@ Prefix for package databases and system configuration (same as \fB\-\-sysroot\fR
 .SH EXIT STATUS
 .TP
 .B 0
-Nothing found above info.
+Nothing found above info; entries in the yours tier never change the status.
 .TP
 .B 1
 At least one medium or warning finding.

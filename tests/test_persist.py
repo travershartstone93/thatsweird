@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fixtures import make_pacman_pkg, make_stub_file  # noqa: E402
-from helpers import FakeRunCommand, scan_args  # noqa: E402
+from helpers import FakeRunCommand, sandbox_root, scan_args  # noqa: E402
 from test_arch import ARCH, ArchBox  # noqa: E402
 
 
@@ -199,7 +199,9 @@ class PersistSources(PersistBox):
         self.assertEqual(len(entries), 1, entries)
         e = entries[0]
         self.assertEqual((e.source, e.target, e.trust, e.severity, e.attack),
-                         ("shell rc", f"{self.home}/.cargo/env", "USER_LOCAL", "medium", "T1546.004"))
+                         ("shell rc", f"{self.home}/.cargo/env", "USER_LOCAL", "info", "T1546.004"))
+        self.assertTrue(e.yours)
+        self.assertIn("your own unpackaged software", e.provenance)
         self.assertEqual(e.key, "line 3 (source)")
 
     def test_udev_run(self):
@@ -216,7 +218,7 @@ class PersistOutput(PersistBox):
         data = json.loads(out)
         self.assertEqual(code, 0)
         self.assertEqual(data["entries"], [])
-        self.assertEqual(data["counts"], {"critical": 0, "medium": 0, "info": 0, "total": 0})
+        self.assertEqual(data["counts"], {"critical": 0, "medium": 0, "info": 0, "yours": 0, "total": 0})
         self.assertIn("host", data)
         self.assertIn("timestamp", data)
 
@@ -224,17 +226,18 @@ class PersistOutput(PersistBox):
         self.home_file(".config/systemd/user/tool.service", "[Service]\nExecStart=%h/bin/tool.sh\n")
         out, code = self.persist(json=True)
         data = json.loads(out)
-        self.assertEqual(code, 1)
-        self.assertEqual(data["counts"]["medium"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual((data["counts"]["medium"], data["counts"]["yours"], data["counts"]["info"]), (0, 1, 0))
         self.assertEqual(data["entries"][0]["trust"], "USER_LOCAL")
         self.assertEqual(data["entries"][0]["attack"], "T1543.002")
+        self.assertTrue(data["entries"][0]["yours"])
 
         make_stub_file(self.sysroot, "/tmp/evil")
         self.sys_file("/etc/systemd/system/evil.service", "[Service]\nExecStart=/tmp/evil\n")
         out, code = self.persist(json=True)
         data = json.loads(out)
         self.assertEqual(code, 2)
-        self.assertEqual([e["severity"] for e in data["entries"]], ["critical", "medium"])
+        self.assertEqual([e["severity"] for e in data["entries"]], ["critical", "info"])
 
     def test_table_hides_info_unless_all(self):
         self.add_official("conky", "/usr/bin/conky")
@@ -245,7 +248,7 @@ class PersistOutput(PersistBox):
         self.assertEqual(code, 2)
         self.assertIn("/tmp/evil", out)
         self.assertNotIn("/usr/bin/conky", out)
-        self.assertIn("1 critical, 0 medium, 1 info", out)
+        self.assertIn("1 critical, 0 medium, 0 your own unpackaged software, 1 info", out)
         self.assertIn("T1543.002", out)
         out, _ = self.persist(all=True)
         self.assertIn("/usr/bin/conky", out)
@@ -311,6 +314,104 @@ class ArchHooks(PersistBox):
         make_stub_file(self.sysroot, "/usr/local/bin/strip")
         e = self.entry(self.entries(), source="makepkg.conf")
         self.assertEqual((e.trust, e.severity), ("USER_LOCAL", "medium"))
+
+
+class DeveloperHome(PersistBox):
+    """A developer's own rc lines and user units are "yours"; a second signal makes them medium."""
+    sandbox_dir = sandbox_root()
+
+    def setUp(self):
+        super().setUp()
+        self.add_official("python", "/usr/bin/python3")
+        self.home_file(".cargo/env", "export PATH=$HOME/.cargo/bin:$PATH\n")
+        self.home_script(".local/bin/splashfetch")
+        self.home_file(".bashrc", '. "$HOME/.cargo/env"\n~/.local/bin/splashfetch\n')
+        self.home_file(".profile", '. "$HOME/.cargo/env"\n')
+        self.home_file(".config/fish/config.fish", "source ~/.cargo/env\n")
+        self.home_script("dealscout/app.py", "print('hi')\n")
+        self.home_script("bin/verify.sh")
+        self.home_file(".config/systemd/user/dealscout.service",
+                       "[Service]\nExecStart=/usr/bin/python3 %h/dealscout/app.py\nRestart=always\nRestartSec=5\n")
+        self.home_file(".config/systemd/user/verify.service",
+                       "[Service]\nExecStart=%h/bin/verify.sh\nRestart=always\nRestartSec=3\n")
+        make_stub_file(self.sysroot, "/usr/local/bin/foo")
+        self.sys_file("/etc/systemd/system/foo.service", "[Service]\nExecStart=/usr/local/bin/foo\n")
+
+    def home_script(self, rel, text="#!/bin/sh\necho hi\n"):
+        path = self.home_file(rel, text)
+        path.chmod(0o755)
+        return path
+
+    def by_severity(self, entries):
+        return {level: sorted(e.file for e in entries if e.severity == level and not e.yours)
+                for level in ("critical", "medium")}
+
+    def test_only_the_system_unit_is_medium(self):
+        entries = self.entries()
+        yours = [e for e in entries if e.yours]
+        self.assertEqual(self.by_severity(entries), {"critical": [], "medium": ["/etc/systemd/system/foo.service"]})
+        self.assertEqual(len(yours), 6, [(e.file, e.target) for e in yours])
+        for e in yours:
+            self.assertEqual((e.severity, e.trust), ("info", "USER_LOCAL"), e)
+            self.assertIn("your own unpackaged software", e.provenance)
+        foo = self.entry(entries, file="/etc/systemd/system/foo.service")
+        self.assertIn("system-wide persistence of unpackaged code", foo.provenance)
+        loop = self.entry(entries, file=f"{self.home}/.config/systemd/user/verify.service")
+        self.assertIn("restart loop (Restart=always every 3s)", loop.provenance)
+        counts = self.weird.persist_counts(entries)
+        self.assertEqual((counts["critical"], counts["medium"], counts["yours"]), (0, 1, 6))
+        out, code = self.persist()
+        self.assertEqual(code, 1)
+        self.assertIn("0 critical, 1 medium, 6 your own unpackaged software, 0 info", out)
+        self.assertNotIn("splashfetch", out)
+        out, _ = self.persist(all=True)
+        self.assertIn("splashfetch", out)
+
+    def test_attacker_fixtures_keep_their_critical(self):
+        make_stub_file(self.sysroot, "/tmp/evil")
+        make_stub_file(self.sysroot, "/tmp/evil.so")
+        self.sys_file("/etc/systemd/system/evil.service", "[Service]\nExecStart=/tmp/evil\n")
+        self.sys_file("/etc/ld.so.preload", "/tmp/evil.so\n")
+        self.add_official("sudo", "/usr/bin/sudo")
+        self.home_script(".local/bin/sudo")
+        self.home_file(".ssh/authorized_keys", 'command="/tmp/evil" ssh-ed25519 AAAA me@laptop\n')
+        entries = self.entries()
+        self.assertEqual(self.by_severity(entries), {
+            "critical": ["/etc/ld.so.preload", "/etc/systemd/system/evil.service",
+                         f"{self.home}/.local/bin/sudo", f"{self.home}/.ssh/authorized_keys"],
+            "medium": ["/etc/systemd/system/foo.service"]})
+        self.assertEqual(self.weird.persist_counts(entries)["yours"], 6)
+
+    def test_second_signals_make_it_medium(self):
+        self.home_script(".venv/bin/python", "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n")
+        self.home_file(".config/systemd/user/dealscout.service",
+                       "[Service]\nExecStart=%h/.venv/bin/python %h/dealscout/app.py\nRestart=always\nRestartSec=5\n")
+        self.home_script("bin/hook.sh")
+        self.sys_file("/etc/profile.d/hook.sh", f"{self.home}/bin/hook.sh\n")
+        entries = self.entries()
+        venv = self.entry(entries, file=f"{self.home}/.config/systemd/user/dealscout.service")
+        self.assertEqual((venv.severity, venv.yours), ("medium", False))
+        self.assertIn("under an unpackaged interpreter", venv.provenance)
+        hook = self.entry(entries, file="/etc/profile.d/hook.sh")
+        self.assertEqual((hook.severity, hook.yours), ("medium", False))
+        self.assertIn("a system file runs code under your home", hook.provenance)
+
+    def test_newer_target_is_noted_not_raised(self):
+        os.utime(self.home / "bin/verify.sh", (2_000_000_000, 2_000_000_000))
+        e = self.entry(self.entries(), file=f"{self.home}/.config/systemd/user/verify.service")
+        self.assertEqual((e.severity, e.yours), ("info", True))
+        self.assertIn("target changed after the file that runs it", e.provenance)
+
+    def test_ssh_commands_under_home_are_yours(self):
+        self.home_script("bin/proxy.sh")
+        self.home_file(".ssh/config", f"Host pi\n  ProxyCommand {self.home}/bin/proxy.sh %h\n")
+        self.home_file(".ssh/authorized_keys", f'command="{self.home}/bin/verify.sh" ssh-ed25519 AAAA me@laptop\n')
+        entries = self.entries()
+        proxy = self.entry(entries, source="ssh config")
+        self.assertEqual((proxy.severity, proxy.yours, proxy.provenance), ("info", True, "your own unpackaged software"))
+        key = self.entry(entries, source="ssh key")
+        self.assertEqual(key.severity, "medium")
+        self.assertNotIn("unowned or temporary", key.provenance)
 
 
 if __name__ == "__main__":

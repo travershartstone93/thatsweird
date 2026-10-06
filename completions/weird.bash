@@ -26,7 +26,7 @@ _weird() {
         "dev watch") words="-h --help --poll --events --follow --no-follow --falco --journal" ;;
         "dev restart-needed") words="-h --help --json" ;;
         "dev persist") words="-h --help --json -a --all --journal --prometheus" ;;
-        "dev hidden") words="-h --help --json --journal --prometheus" ;;
+        "dev hidden") words="-h --help --json --deep --journal --prometheus" ;;
         "dev kernel") words="-h --help --json --journal --prometheus" ;;
         "dev aur") words="-h --help --json -a --all --pkgbuild-dir --campaigns --fetch-campaigns --journal --prometheus" ;;
         "dev self-check") words="-h --help --json" ;;

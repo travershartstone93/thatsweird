@@ -87,6 +87,37 @@ class HiddenPids(HiddenBox):
         self.assertEqual(len(probed), 5000 - 2)
         self.assertNotIn(100, probed)
 
+    def test_default_probe_stops_above_the_last_pid_assigned(self):
+        _write(self.proc / "sys/kernel/pid_max", "100000\n")
+        _write(self.proc / "loadavg", "0.50 0.40 0.30 1/2 3000\n")
+        self.assertEqual(self.weird.hidden_probe_limit({100, 4242}), 6242)
+        self.assertEqual(self.weird.hidden_probe_limit({100, 4242}, deep=True), 100000)
+        _write(self.proc / "loadavg", "0.50 0.40 0.30 1/2 90000\n")
+        self.assertEqual(self.weird.hidden_probe_limit({100}), 94500)
+        _write(self.proc / "loadavg", "0.50 0.40 0.30 1/2 99000\n")
+        self.assertEqual(self.weird.hidden_probe_limit({100}), 100000)
+        os.remove(self.proc / "loadavg")
+        self.assertEqual(self.weird.hidden_probe_limit({100}), 100000)
+        _write(self.proc / "loadavg", "0.50 0.40 0.30 1/2 3000\n")
+        original = self.weird.probe_pid
+        with mock.patch.object(self.weird, "probe_pid", side_effect=original) as spy:
+            out, _ = self.hidden()
+        self.assertEqual(max(call.args[0] for call in spy.call_args_list), 6242)
+        self.assertIn("2 pids listed, pids 1..6242 probed", out)
+        payload, _ = self.hidden_json()
+        self.assertEqual((payload["pid_max"], payload["probed_to"]), (100000, 6242))
+
+    def test_pid_above_the_mark_needs_deep(self):
+        _write(self.proc / "sys/kernel/pid_max", "100000\n")
+        _write(self.proc / "loadavg", "0.50 0.40 0.30 1/2 1000\n")
+        with self.hide(4242):
+            payload, code = self.hidden_json()
+            self.assertEqual((code, payload["hidden_pids"]), (0, []))
+            out, code = self.hidden(json=True, deep=True)
+        payload = json.loads(out)
+        self.assertEqual((code, [h["pid"] for h in payload["hidden_pids"]]), (2, [4242]))
+        self.assertEqual(payload["probed_to"], 100000)
+
     def test_pid_max_default_and_cap(self):
         os.remove(self.proc / "sys/kernel/pid_max")
         self.assertEqual(self.weird.read_pid_max(), 32768)

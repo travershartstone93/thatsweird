@@ -42,14 +42,16 @@ class OneCommandTests(PersistBox):
                       "== Hidden processes =="):
             self.assertIn(title, text)
         self.assertNotIn("== Stale binaries", text)
-        self.assertRegex(text.splitlines()[-1], r"^summary: \d+ critical, \d+ medium, \d+ low, \d+ info")
+        self.assertRegex(text.splitlines()[-1],
+                         r"^summary: \d+ to look at \(\d+ critical, \d+ medium, \d+ low\), "
+                         r"\d+ entries are your own unpackaged software, \d+ info \(exit 0\)$")
         self.assertEqual(code, 0, text)
 
     def test_exit_code_aggregates_across_sections(self):
         self.sys_file("/etc/ld.so.preload", "/tmp/evil.so\n")
         text, code = self.weird_main()
         self.assertEqual(code, 2, text)
-        self.assertIn("summary: 1 critical", text)
+        self.assertIn("summary: 1 to look at (1 critical", text)
         self.assertIn("(exit 2)", text)
 
     def test_skip_omits_a_section(self):

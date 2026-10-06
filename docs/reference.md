@@ -8,20 +8,32 @@ The sections below are the sections of one plain `weird` run; each is also a
 
 ## One run
 
-Plain `weird` runs, in order: the self-check lines (only when something is
+Plain `weird` prints, in order: the self-check lines (only when something is
 wrong), the process scan, AUR packages (foreign package list, known-bad
 cross-check, PKGBUILD analysis), persistence entries, kernel posture and
 findings, stale binaries (only when a process still runs a replaced file) and
-the hidden-process cross-views (the slow pid probe, last). One summary line
-counts findings by severity across every section and the exit status is 2 with
-any critical finding, 1 with any medium or warning one, 0 when clean and 3 when
-a collector failed (that section is reported as failed and the rest still
-prints).
+the hidden-process cross-views (the pid probe, last). The AUR, persistence and
+kernel sections run in threads while the process scan runs, so the whole report
+takes a few seconds; the output order never changes. A section with nothing to
+show prints its header and one "nothing to report" line with its counts; the
+tables, the kernel posture rows, the info notes and the security banner appear
+with `-v` and in the single `weird dev` commands.
+
+The summary line reads
+`summary: N to look at (c critical, m medium, l low), M entries are your own
+unpackaged software, I info (exit E)`. "To look at" is what sets the exit
+status: 2 with any critical finding, 1 with any medium or warning one, 0 when
+clean and 3 when a collector failed (that section is reported as failed and the
+rest still prints). "Your own unpackaged software" counts the persistence
+entries in the yours tier (below); they never change the exit status. `--json`
+carries the same numbers under "summary", with "yours" as its own key.
 
 `--skip SECTION` leaves a section out (processes, aur, persist, kernel, stale,
 hidden; repeatable). `-v` shows every process, the info rows and the notes
 behind each finding. `--json` prints one object with a key per section plus
 "summary"; `--ndjson` is one line per process and covers the scan section only.
+`--deep` hashes every packaged executable (below) and makes the hidden section
+sweep every pid up to pid_max instead of stopping at the last pid assigned.
 `--journal` and `--prometheus PATH` apply to every section. `--offline SYSROOT`
 runs the live-media checks instead (below). `--no-prompt`, or WEIRD_NO_PROMPT in
 the environment, means weird never asks a question; the only question it has is
@@ -117,7 +129,22 @@ longer matches the package, or the entry lives under /tmp, /dev/shm or /var/tmp;
 **medium** for inline scripts, USER_LOCAL or LOCAL_BUILD targets and shell rc
 hits; **info** otherwise. An inline script in a unit or hook file that a package
 shipped and that still matches its install hash is the distro's script, so it
-stays info. Each source carries its MITRE ATT&CK id in the JSON (T1543.002
+stays info.
+
+The yours tier: a USER_LOCAL target under the current user's home (~/.local,
+~/.cargo, ~/.config, a project directory, a venv) launched from a file that is
+also under the home (a user unit, ~/.bashrc, ~/.ssh/config) is what a
+developer machine looks like, so it is **info** with the provenance note "your
+own unpackaged software" and the entry carries `"yours": true` in the JSON. It
+becomes **medium** with a second signal: the launching file lives under /etc or
+/usr ("a system file runs code under your home"), a restart loop keeps it alive
+through an interpreter no package owns (a venv python, say), or any temp-dir or
+integrity hit (critical, as above). A target that changed after the file that
+runs it is noted but stays info, because scripts are edited more often than
+units. A unit under /etc/systemd/system that points at an unpackaged file under
+/usr/local stays medium and says so: "system-wide persistence of unpackaged
+code". The count line splits the same way: critical, medium, your own
+unpackaged software, info. Each source carries its MITRE ATT&CK id in the JSON (T1543.002
 services, T1053.006 timers, T1053.003 cron, T1547.013 autostart, T1546.004 shell
 rc, T1574.006 ld.so.preload, T1546 udev and pacman hooks, T1195.001 makepkg.conf).
 
@@ -136,11 +163,13 @@ Three further sources, read without root:
   curl, bash ...) is critical [T1036.005]; a symlink to the real binary is info.
 - SSH footholds: ~/.ssh/authorized_keys entries with a forced command,
   forwarding options, a wildcard from= or no comment are medium, critical when
-  the command lives in a temp dir or an unowned path [T1098.004]; ssh config
-  ProxyCommand/LocalCommand from such paths is medium.
+  the command lives in a temp dir or an unowned path outside the home
+  [T1098.004]; ssh config ProxyCommand/LocalCommand from such paths is medium,
+  and from the user's own script under the home it is a yours-tier info entry.
 - Restart loops: a systemd unit with Restart=always or on-failure and a
   RestartSec under 60 whose target is unowned or user-local is raised one
-  severity step ("restart loop keeps it alive") [T1543.002].
+  severity step ("restart loop keeps it alive") [T1543.002]; a yours-tier
+  entry only when the interpreter is unpackaged too.
 
 ## Hidden processes, threads and sockets
 
@@ -149,11 +178,17 @@ top and from weird's own scan. `weird dev hidden` reads the same facts through
 two paths each and reports every disagreement:
 
 - pids: the directory listing of /proc against a direct `stat` of
-  `/proc/<pid>/stat` for every pid from 1 to `pid_max` (what unhide does).
-  A pid that answers but is not listed is **critical** (T1564.001). Thread
-  ids also answer without being listed, so a hit whose Tgid is another pid
-  is skipped, and every hit is confirmed a second time so a process that
-  started or exited during the walk is not reported.
+  `/proc/<pid>/stat` and a `getpgid()` call for every pid from 1 up to the
+  probe limit (what unhide does). A pid that answers but is not listed is
+  **critical** (T1564.001). Thread ids also answer without being listed, so a
+  hit whose Tgid is another pid is skipped, and every hit is confirmed a
+  second time so a process that started or exited during the walk is not
+  reported. The limit is the high-water mark plus a margin: the last pid the
+  kernel assigned (the last field of /proc/loadavg) or the highest listed
+  pid, whichever is larger, plus 2000 or five percent. A hidden process is
+  already running, so its pid is at or below that mark; probing further only
+  costs time. `--deep` sweeps every pid up to `pid_max` (the counter can
+  wrap on a long-running system, and that is the one case the mark misses).
 - sockets: inodes in /proc/net/{tcp,tcp6,udp,udp6} against `ss -tunapHe`,
   which asks the kernel over netlink. A socket only one side knows about is
   **critical** (T1014). /proc/net is read before and after ss so churn is
@@ -163,12 +198,13 @@ two paths each and reports every disagreement:
 - totals: the task count in the fourth field of /proc/loadavg against the
   threads counted over the listing, with a margin for normal churn: **low**.
 
-The full probe is about seven seconds on a 4194304 pid_max system, most of
-it inside the kernel.
+The default probe takes under a second; the `--deep` sweep is about fifteen
+seconds on a 4194304 pid_max system, most of it inside the kernel.
 
 ```bash
 weird dev hidden           # findings table with an explanation under each row
-weird dev hidden --json    # {host, timestamp, self_check, pid_max, listed_pids, hidden_pids, findings, counts}
+weird dev hidden --deep    # every pid up to pid_max
+weird dev hidden --json    # {host, timestamp, self_check, pid_max, probed_to, listed_pids, hidden_pids, findings, counts}
 ```
 
 Exit code is 2 with any critical finding, 1 with any medium one, 0 otherwise.

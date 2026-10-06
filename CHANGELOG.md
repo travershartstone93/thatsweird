@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.0
+
+Faster and quieter. The default hidden-process probe stops a margin above the
+last pid the kernel assigned (the last field of /proc/loadavg, or the highest
+listed pid), since a hidden process is already running and so already has a
+pid at or below that mark; `--deep` keeps the exhaustive sweep up to pid_max.
+The AUR, persistence and kernel sections run in threads while the process
+scan runs, with the report printed in the same fixed order, so a full run on a
+laptop went from about 23 s to about 5 s and `--skip hidden` to about 4 s.
+
+The persistence section has a "yours" tier: a target under your own home
+launched by your own unit, rc file or ssh config is your own unpackaged
+software and is info, listed with `-v`, until a second signal appears (a unit
+under /etc or /usr pointing into your home, a restart loop through an
+unpackaged interpreter, a temp directory, a changed packaged file). A unit
+under /etc/systemd/system that points at an unpackaged file under /usr/local
+stays medium and says "system-wide persistence of unpackaged code". The
+summary line now reads "N to look at (c critical, m medium, l low), M entries
+are your own unpackaged software, I info (exit E)"; only "to look at" sets the
+exit status, and the JSON summary has a "yours" key. The persistence count
+line and counts split the same way, and each entry carries "yours" in JSON.
+
+The one-command report starts at the first section header: the security
+banner and the "Scanning processes..." line print with `-v` and in `weird dev
+scan`, a section with nothing to show prints one "nothing to report" line, the
+kernel posture rows and info notes appear with `-v`, and a clean report fits
+on one screen. A GitHub name match no longer says "possible match" twice, and
+an unpackaged binary with no description is described by where it lives and
+when it was installed ("unpackaged, ~/.local/share/claude (2026-10-05)").
+
 ## 1.2.0
 
 One command. Plain `weird` now runs the process scan, the AUR package checks,

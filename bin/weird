@@ -30,6 +30,7 @@ import sys
 import socket
 import tempfile
 import textwrap
+import threading
 try:
     import tomllib  # Python 3.11+
 except Exception:
@@ -38,11 +39,12 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from datetime import datetime
 import time
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 # =============================================================================
@@ -1676,6 +1678,7 @@ class FilePackageCache:
         self._db_mtime: str = ""
         # False for a container root: built in memory, never written to or read from CACHE_FILE
         self.persist = persist
+        self._lock = threading.RLock()
 
     @staticmethod
     def _compute_cache_checksum(cache_data: Dict[str, str], mtime, managers: Optional[Dict[str, str]] = None) -> str:
@@ -1704,11 +1707,15 @@ class FilePackageCache:
 
     def build(self, force: bool = False) -> None:
         """Build the file->package cache from dpkg list files and the pacman local database."""
+        with self._lock:
+            self._build(force)
+
+    def _build(self, force: bool) -> None:
         debug_log("cache_build", f"start force={force}")
         current_mtime = self._db_freshness_key()
+        if not force and self._db_mtime == current_mtime and self._cache:
+            return
         if not self.persist:
-            if self._db_mtime == current_mtime and self._cache:
-                return
             force = True
 
         # Check if rebuild needed
@@ -2585,6 +2592,9 @@ _pacman_sync_index: Optional[Dict[str, Dict[str, str]]] = None
 _pacman_sync_index_tried = False
 
 
+_sync_index_lock = threading.Lock()
+
+
 def load_pacman_sync_index() -> Optional[Dict[str, Dict[str, str]]]:
     """name -> {repo, version} from one `pacman -Sl`; first repo in pacman.conf order wins.
 
@@ -2592,19 +2602,20 @@ def load_pacman_sync_index() -> Optional[Dict[str, Dict[str, str]]]:
     One subprocess per run instead of one per package (each -Si reloads every sync database).
     """
     global _pacman_sync_index, _pacman_sync_index_tried
-    if _pacman_sync_index_tried:
-        return _pacman_sync_index
-    _pacman_sync_index_tried = True
-    out = run_command(["pacman", "-Sl"], timeout=30)
-    if out is None:
-        return None
-    index: Dict[str, Dict[str, str]] = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[1] not in index:
-            index[parts[1]] = {"repo": parts[0], "version": parts[2]}
-    _pacman_sync_index = index
-    return index
+    with _sync_index_lock:
+        if _pacman_sync_index_tried:
+            return _pacman_sync_index
+        _pacman_sync_index_tried = True
+        out = run_command(["pacman", "-Sl"], timeout=30)
+        if out is None:
+            return None
+        index: Dict[str, Dict[str, str]] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] not in index:
+                index[parts[1]] = {"repo": parts[0], "version": parts[2]}
+        _pacman_sync_index = index
+        return index
 
 
 def is_distro_packager(packager: str) -> bool:
@@ -4101,26 +4112,65 @@ def root_cache_key(path: str) -> object:
         return path
 
 
+class RootGate:
+    """Sections running in threads read the module root; sysroot_override swaps it only while none does."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.readers = 0
+        self.swapped = False
+
+    @contextlib.contextmanager
+    def reading(self):
+        with self.cond:
+            while self.swapped:
+                self.cond.wait()
+            self.readers += 1
+        try:
+            yield
+        finally:
+            with self.cond:
+                self.readers -= 1
+                self.cond.notify_all()
+
+    @contextlib.contextmanager
+    def swapping(self):
+        with self.cond:
+            while self.readers:
+                self.cond.wait()
+            self.swapped = True
+        try:
+            yield
+        finally:
+            with self.cond:
+                self.swapped = False
+                self.cond.notify_all()
+
+
+_root_gate = RootGate()
+
+
 @contextlib.contextmanager
 def sysroot_override(path: str):
     """Run package lookups against another root (a container's /proc/<pid>/root), then put everything back."""
     global SYSROOT
-    scope = globals()
-    saved_root = SYSROOT
-    saved = {name: scope[name] for name in ROOT_CACHE_NAMES}
-    key = root_cache_key(path)
-    caches = _root_caches.get(key)
-    if caches is None:
-        caches = {name: (FilePackageCache(persist=False) if name == "file_package_cache" else {})
-                  for name in ROOT_CACHE_NAMES}
-        _root_caches[key] = caches
-    scope.update(caches)
-    SYSROOT = os.path.abspath(path)
-    try:
-        yield
-    finally:
-        SYSROOT = saved_root
-        scope.update(saved)
+    with _root_gate.swapping():
+        scope = globals()
+        saved_root = SYSROOT
+        saved = {name: scope[name] for name in ROOT_CACHE_NAMES}
+        key = root_cache_key(path)
+        caches = _root_caches.get(key)
+        if caches is None:
+            caches = {name: (FilePackageCache(persist=False) if name == "file_package_cache" else {})
+                      for name in ROOT_CACHE_NAMES}
+            _root_caches[key] = caches
+        scope.update(caches)
+        SYSROOT = os.path.abspath(path)
+        try:
+            yield
+        finally:
+            SYSROOT = saved_root
+            scope.update(saved)
 
 
 def container_root_readable(pid: int) -> bool:
@@ -5883,6 +5933,29 @@ def get_trust_color(trust_level: TrustLevel, weirdness_score: int = 0) -> str:
     return colors.get(trust_level, "\033[0m")
 
 
+def unpackaged_description(path: str) -> str:
+    """'unpackaged, ~/.local/share/claude (2026-09-12)' for a binary no package owns, under 50 characters."""
+    home = str(Path.home())
+    if path.startswith(home + "/"):
+        parts = path[len(home) + 1:].split("/")[:-1]
+        keep = 3 if parts[:1] == [".local"] else 2
+        location = "~/" + "/".join(parts[:keep]) if parts else "~"
+    elif path.startswith("/usr/local/"):
+        location = "/".join(path.split("/")[:4])
+    else:
+        return "(no description)"
+    text = f"unpackaged, {location}"
+    try:
+        installed = datetime.fromtimestamp(os.stat(path).st_mtime).strftime("%Y-%m-%d")
+    except OSError:
+        return text
+    if len(f"{text}, installed {installed}") <= 50:
+        return f"{text}, installed {installed}"
+    if len(f"{text} ({installed})") <= 50:
+        return f"{text} ({installed})"
+    return text
+
+
 def format_process_table(processes: List[ProcessInfo], verbose: bool = False) -> str:
     """Format processes as a table."""
     reset = "\033[0m"
@@ -5930,7 +6003,7 @@ def format_process_table(processes: List[ProcessInfo], verbose: bool = False) ->
         if desc:
             desc_display = desc[:50] + "..." if len(desc) > 53 else desc
         else:
-            desc_display = (verdict_for(proc) if proc.signal_keys else "") or "(no description)"
+            desc_display = (verdict_for(proc) if proc.signal_keys else "") or unpackaged_description(proc.path)
         if proc.tags:
             desc_display += " [" + ", ".join(proc.tags) + "]"
 
@@ -6007,6 +6080,7 @@ def format_process_detail(proc: ProcessInfo) -> str:
 
             if source == "GitHub":
                 lines.append(f"\n{bold}Possible match on GitHub (name only, unverified):{reset}")
+                description = description.removeprefix("possible match: ")
             else:
                 lines.append(f"\n{bold}Process Identification ({source}):{reset}")
 
@@ -6686,15 +6760,17 @@ def cmd_scan(args) -> int:
     # Security disclaimer (unless in JSON mode)
     if not args.json and not args.ndjson:
         print_self_check(warnings)
-        print("\033[33m" + "=" * 70 + "\033[0m")
-        print("\033[33mSECURITY NOTE: Trust levels indicate PROVENANCE, not security.\033[0m")
-        print("\033[33mEven 'OFFICIAL' packages can be compromised (e.g., xz backdoor).\033[0m")
-        print("\033[33mThis tool is for defense-in-depth, not a complete security solution.\033[0m")
-        print("\033[33m" + "=" * 70 + "\033[0m\n")
+        if not brief_section(args):
+            print("\033[33m" + "=" * 70 + "\033[0m")
+            print("\033[33mSECURITY NOTE: Trust levels indicate PROVENANCE, not security.\033[0m")
+            print("\033[33mEven 'OFFICIAL' packages can be compromised (e.g., xz backdoor).\033[0m")
+            print("\033[33mThis tool is for defense-in-depth, not a complete security solution.\033[0m")
+            print("\033[33m" + "=" * 70 + "\033[0m\n")
         if pacman_local_files_unsigned():
             print(f"\033[33mWARNING: pacman LocalFileSigLevel = {get_pacman_local_file_siglevel()}: "
                   "locally built packages (makepkg/AUR) are installed unsigned\033[0m")
-        print("Scanning processes...")
+        if not brief_section(args):
+            print("Scanning processes...")
 
     started = time.monotonic()
     processes, alerts, exit_code = run_scan(args)
@@ -6770,6 +6846,9 @@ def cmd_scan(args) -> int:
 
     # Output
     if not processes:
+        if brief_section(args):
+            print(f"nothing to report ({plural(_processes_examined, 'process', 'processes')} examined)")
+            return exit_code
         print("\nNo suspicious processes found.")
         if args.log_file:
             log_event(args.log_file, "scan no_suspicious_processes")
@@ -7558,6 +7637,7 @@ class PersistEntry:
     integrity: str = ""
     severity: str = "info"
     attack: str = ""
+    yours: bool = False
 
 
 def persist_home() -> str:
@@ -7721,6 +7801,19 @@ def in_temp_dir(path: str) -> bool:
     return path.startswith(PERSIST_TEMP_PREFIXES) and not under_home(path)
 
 
+def yours_path(path: str) -> bool:
+    """An existing file under the user's own home, outside temp dirs, that no package owns."""
+    path = persist_expand_home(path)
+    return under_home(path) and not in_temp_dir(path) and os.path.exists(path) and not file_package_cache.get(path)
+
+
+def newer_than(path: str, other: str) -> bool:
+    try:
+        return os.stat(persist_host_path(path)).st_mtime > os.stat(persist_host_path(other)).st_mtime
+    except OSError:
+        return False
+
+
 _pristine_cache: Dict[str, bool] = {}
 
 
@@ -7782,13 +7875,11 @@ def assess_persist_entry(entry: PersistEntry) -> None:
     if entry.via:
         notes.append(f"run by {entry.via}")
     entry.trust = level.value
-    entry.provenance = ", ".join(notes)
 
     # an inline script in a file the distro shipped, unchanged, is the distro's script
     shipped_inline = entry.inline and persist_file_pristine(entry.file)
     if shipped_inline:
         notes.append("file unchanged since package install")
-        entry.provenance = ", ".join(notes)
     if temp or entry.integrity == "modified" or level == TrustLevel.UNKNOWN:
         severity = "critical"
     elif (entry.inline and not shipped_inline) or level in (TrustLevel.LOCAL_BUILD, TrustLevel.USER_LOCAL, TrustLevel.USER_PKG):
@@ -7798,7 +7889,20 @@ def assess_persist_entry(entry: PersistEntry) -> None:
     if severity == "critical" and entry.source in PERSIST_LOW_PRIORITY_SOURCES and not temp \
             and entry.integrity != "modified":
         severity = "medium"
+    # the user's own scripts under their own home, run by their own rc files and units, are
+    # what a developer machine looks like; a second signal is needed before they count
+    if severity == "medium" and level == TrustLevel.USER_LOCAL and under_home(target):
+        if not under_home(entry.file):
+            notes.append("a system file runs code under your home")
+        else:
+            severity, entry.yours = "info", True
+            notes.append("your own unpackaged software")
+            if newer_than(target, entry.file):
+                notes.append("target changed after the file that runs it")
+    elif severity == "medium" and level in (TrustLevel.USER_LOCAL, TrustLevel.USER_PKG) and not under_home(entry.file):
+        notes.append("system-wide persistence of unpackaged code")
     entry.severity = severity
+    entry.provenance = ", ".join(notes)
 
 
 def expand_unit_specifiers(text: str) -> str:
@@ -8111,9 +8215,9 @@ def ssh_path_suspicious(path: str) -> bool:
     host = persist_host_path(path)
     if not os.path.exists(host):
         return True
-    if under_home(path):
-        return True
     file_package_cache.build()
+    if under_home(path):
+        return not yours_path(path)
     return pacman_owner(path) is None
 
 
@@ -8190,6 +8294,10 @@ def persist_ssh_foothold_entries() -> List[PersistEntry]:
             entries.append(PersistEntry("ssh config", config, f"line {number} {key}", value, target=target,
                                         trust="UNKNOWN", provenance="command from an unowned or temporary path",
                                         severity="medium", attack="T1098.004"))
+        elif target and ("/" in target) and yours_path(target):
+            entries.append(PersistEntry("ssh config", config, f"line {number} {key}", value, target=target,
+                                        trust="USER_LOCAL", provenance="your own unpackaged software",
+                                        severity="info", attack="T1098.004", yours=True))
     return entries
 
 
@@ -8231,6 +8339,13 @@ def persist_apply_restart_loops(entries: List[PersistEntry]) -> None:
         loop = unit_restart_loop(entry.file)
         if loop is None:
             continue
+        if entry.yours:
+            if entry.via and not file_package_cache.get(entry.via):
+                entry.severity, entry.yours = "medium", False
+                entry.provenance = f"{entry.provenance}, restart loop keeps it alive ({loop}) under an unpackaged interpreter"
+            else:
+                entry.provenance = f"{entry.provenance}, restart loop ({loop})"
+            continue
         if entry.severity == "medium" and (entry.trust == "UNKNOWN" or in_temp_dir(entry.target or "")):
             entry.severity = "critical"
         elif entry.severity != "medium":
@@ -8260,14 +8375,15 @@ def collect_persistence() -> List[PersistEntry]:
         assess_persist_entry(entry)
     persist_apply_restart_loops(entries)
     entries += persist_extra_entries()
-    entries.sort(key=lambda e: (PERSIST_SEVERITY_ORDER[e.severity], e.source, e.file, e.key))
+    entries.sort(key=lambda e: (PERSIST_SEVERITY_ORDER[e.severity], not e.yours, e.source, e.file, e.key))
     return entries
 
 
 def persist_counts(entries: List[PersistEntry]) -> Dict[str, int]:
     counts = {level: 0 for level in PERSIST_SEVERITY_ORDER}
+    counts["yours"] = 0
     for entry in entries:
-        counts[entry.severity] += 1
+        counts["yours" if entry.yours else entry.severity] += 1
     counts["total"] = len(entries)
     return counts
 
@@ -8313,6 +8429,12 @@ def cmd_persist(args) -> int:
 
     show_all = getattr(args, "all", False) or getattr(args, "verbose", False)
     shown = [e for e in entries if show_all or e.severity != "info"]
+    split = (f"{counts['critical']} critical, {counts['medium']} medium, "
+             f"{counts['yours']} your own unpackaged software, {counts['info']} info")
+    if not shown and brief_section(args):
+        print(f"nothing to report ({plural(counts['total'], 'persistence entry', 'persistence entries')} checked, "
+              f"{counts['yours']} your own unpackaged software, {counts['info']} info)")
+        return code
     if shown:
         header = f"{'SOURCE':<16} {'FILE':<40} {'TARGET':<36} {'TRUST':<12} SEVERITY"
         print(header)
@@ -8327,9 +8449,8 @@ def cmd_persist(args) -> int:
                       + (f" [{entry.attack}]" if entry.attack else ""))
     else:
         print("Every persistence entry launches a packaged, intact executable.")
-    tail = "" if show_all or not counts["info"] else " (-v lists the info entries)"
-    print(f"\n{counts['total']} persistence entries checked: {counts['critical']} critical, "
-          f"{counts['medium']} medium, {counts['info']} info{tail}")
+    tail = "" if show_all or not counts["info"] + counts["yours"] else " (-v lists the info entries)"
+    print(f"\n{counts['total']} persistence entries checked: {split}{tail}")
     return code
 
 
@@ -8355,13 +8476,21 @@ def sort_findings(findings: List[Finding]) -> None:
     findings.sort(key=lambda f: (FINDING_SEVERITY_ORDER[f.severity], f.subject, f.kind, f.detail))
 
 
-_last_counts: Dict[str, int] = {}
+_section_state = threading.local()
 
 
 def note_counts(counts: Dict[str, int]) -> None:
-    """Severity counts of the section that just ran, read by the combined report."""
-    _last_counts.clear()
-    _last_counts.update(counts)
+    """Severity counts of the section that just ran, read by the combined report (per thread)."""
+    _section_state.counts = dict(counts)
+
+
+def plural(count: int, word: str, words: str = "") -> str:
+    return f"{count} {word if count == 1 else (words or word + 's')}"
+
+
+def brief_section(args) -> bool:
+    """A section of the one-command report without -v: headers, findings and one line when clean."""
+    return bool(getattr(args, "section", False)) and not getattr(args, "verbose", False)
 
 
 def finding_counts(findings: List[Finding]) -> Dict[str, int]:
@@ -8663,7 +8792,31 @@ def status_int(pid: int, name: str) -> Optional[int]:
         return None
 
 
-def find_hidden_pids(listed: Optional[Set[int]] = None) -> List[Dict]:
+def read_last_pid() -> Optional[int]:
+    """The pid the kernel handed out most recently, the last field of /proc/loadavg."""
+    try:
+        with open(proc_path("loadavg")) as f:
+            return int(f.read().split()[4])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def hidden_probe_limit(listed: Set[int], deep: bool = False) -> int:
+    """Highest pid the probes ask about: pid_max under --deep, else a margin above the high-water mark.
+
+    A hidden process is already running, so its pid is at or below the last pid the
+    kernel assigned (or the highest listed pid once the counter has wrapped). Probing
+    further only costs time, which is why the exhaustive sweep is opt-in.
+    """
+    pid_max = read_pid_max()
+    last = read_last_pid()
+    if deep or last is None:
+        return pid_max
+    mark = max(last, max(listed, default=0))
+    return min(pid_max, mark + max(2000, mark // 20))
+
+
+def find_hidden_pids(listed: Optional[Set[int]] = None, limit: Optional[int] = None) -> List[Dict]:
     """Pids that answer a direct stat but are absent from the listing, confirmed a second time.
 
     Thread ids also have a /proc entry without being listed, so a hit whose
@@ -8672,7 +8825,7 @@ def find_hidden_pids(listed: Optional[Set[int]] = None) -> List[Dict]:
     if listed is None:
         listed = list_pids_readdir()
     hidden = []
-    for pid in range(1, read_pid_max() + 1):
+    for pid in range(1, (limit or read_pid_max()) + 1):
         if pid in listed:
             if getpgid_probe(pid) is False and pid_interface_mismatch(pid) == "proc only":
                 hidden.append({"pid": pid, "name": _get_process_name(pid) or "?", "ppid": status_int(pid, "PPid"),
@@ -8877,8 +9030,9 @@ def cmd_hidden(args) -> int:
     warnings = self_check()
     listed = list_pids_readdir()
     pid_max = read_pid_max()
+    limit = hidden_probe_limit(listed, getattr(args, "deep", False))
     load_before = read_loadavg_tasks()
-    hidden = find_hidden_pids(listed)
+    hidden = find_hidden_pids(listed, limit)
     findings = [Finding("hidden pid", f"pid {h['pid']} ({h['name']}): present in /proc but absent from "
                         "the directory listing", "critical", "T1564.001") for h in hidden if not h.get("mismatch")]
     findings += [Finding("hidden pid", f"pid {h['pid']} ({h['name']}): visible to one kernel interface but not "
@@ -8899,20 +9053,23 @@ def cmd_hidden(args) -> int:
     emit_findings_outputs(args, "hidden", findings, started)
 
     if args.json:
-        print(json.dumps(finding_payload(findings, self_check=warnings, pid_max=pid_max,
+        print(json.dumps(finding_payload(findings, self_check=warnings, pid_max=pid_max, probed_to=limit,
                                          listed_pids=len(listed), hidden_pids=hidden), indent=2))
         return code
     print_self_check(warnings)
     shown = [f for f in findings if f.severity != "info"]
+    if not shown and brief_section(args):
+        print(f"nothing to report ({plural(len(listed), 'pid')} listed, pids 1..{limit} probed)")
+        return code
     if shown:
         print_findings(shown, HIDDEN_EXPLANATIONS)
     else:
         print("Every pid, thread and socket the kernel knows about is also visible through the normal listings.")
     for f in findings:
-        if f.severity == "info":
+        if f.severity == "info" and not brief_section(args):
             print(f"note: {f.kind}: {f.detail}")
     counts = finding_counts(findings)
-    print(f"\n{len(listed)} pids listed, pids 1..{pid_max} probed: {counts['critical']} critical, "
+    print(f"\n{plural(len(listed), 'pid')} listed, pids 1..{limit} probed: {counts['critical']} critical, "
           f"{counts['medium']} medium, {counts['low']} low")
     return code
 
@@ -9417,7 +9574,15 @@ def cmd_kernel(args) -> int:
         print(json.dumps(finding_payload(findings, modules=summary, posture=posture), indent=2))
         return code
 
-    print("Posture")
+    shown = [f for f in findings if f.severity != "info"]
+    if not shown and brief_section(args):
+        what = ("reboot pending, module ownership is checked after it" if summary["reboot_pending"] else
+                f"{summary['loaded']} loaded modules, {summary['owned']} owned by packages, "
+                f"taint {'clean' if not taint else taint}")
+        print(f"nothing to report ({what})")
+        return code
+    if not brief_section(args):
+        print("Posture")
     rows = [
         ("secure boot", posture["secure_boot"]),
         ("lockdown", posture["lockdown"]),
@@ -9439,10 +9604,10 @@ def cmd_kernel(args) -> int:
          f"{'?' if summary['kallsyms'] is None else summary['kallsyms']} in kallsyms; "
          f"{summary['owned']} owned by packages, {summary['dkms']} dkms, {len(summary['unowned'])} unowned"),
     ]
-    for label, value in rows:
-        print(f"  {label:<28} {value}")
-    print()
-    shown = [f for f in findings if f.severity != "info"]
+    if not brief_section(args):
+        for label, value in rows:
+            print(f"  {label:<28} {value}")
+        print()
     if shown:
         print_findings(shown, KERNEL_EXPLANATIONS)
     elif summary["reboot_pending"]:
@@ -9450,7 +9615,7 @@ def cmd_kernel(args) -> int:
     else:
         print("Every loaded module is visible in all views, owned by a package, and the kernel is not tainted.")
     for f in findings:
-        if f.severity == "info":
+        if f.severity == "info" and not brief_section(args):
             print(f"note: {f.kind}: {f.detail}")
     counts = finding_counts(findings)
     print(f"\n{counts['critical']} critical, {counts['medium']} medium, {counts['low']} low, {counts['info']} info")
@@ -10332,14 +10497,19 @@ def cmd_aur(args) -> int:
         return code
 
     if not packages:
-        print("No foreign packages installed.")
+        print("nothing to report (no foreign packages installed)" if brief_section(args)
+              else "No foreign packages installed.")
         return 0
-    show_all = getattr(args, "all", False) or getattr(args, "verbose", False)
     if campaigns and not any(f.kind == "known-bad package" for f in findings):
         known_bad += f"; none of the {len(packages)} foreign packages is on any list"
-    print(f"known-bad list: {known_bad}")
     show_all = getattr(args, "all", False)
     shown = [f for f in findings if show_all or f.severity != "info"]
+    if not shown and brief_section(args):
+        checked = sum(1 for p in packages if p.pkgbuild)
+        print(f"nothing to report ({len(packages)} foreign packages, {checked} PKGBUILDs checked; "
+              f"known-bad list: {known_bad})")
+        return code
+    print(f"known-bad list: {known_bad}")
     if shown:
         print_findings(shown, AUR_EXPLANATIONS, subject_header="PACKAGE")
     else:
@@ -11059,6 +11229,8 @@ def add_dev_commands(parser: argparse.ArgumentParser) -> None:
              "stat probes up to pid_max, /proc/net with ss over netlink, and status thread counts with task dirs")
     hidden_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                                help="Output JSON")
+    hidden_parser.add_argument("--deep", action="store_true", default=argparse.SUPPRESS,
+                               help="Probe every pid up to pid_max, not only up to the last pid assigned")
     output_flags(hidden_parser)
 
     # kernel subcommand
@@ -11219,7 +11391,8 @@ def build_parser(with_verbs: bool = False) -> argparse.ArgumentParser:
     parser.add_argument("--ndjson", action="store_true", help="One JSON line per process (scan section only)")
     parser.add_argument("--journal", action="store_true", help="Send alerts and findings to the systemd journal")
     parser.add_argument("--prometheus", metavar="PATH", help="Write node_exporter textfile metrics to PATH")
-    parser.add_argument("--deep", action="store_true", help="Hash every packaged executable against its package")
+    parser.add_argument("--deep", action="store_true",
+                        help="Hash every packaged executable and probe every pid up to pid_max")
     parser.add_argument("--offline", metavar="SYSROOT",
                         help="Live-media mode: check a mounted disk (no process or hidden sections)")
     parser.add_argument("--skip", action="append", default=[], choices=SECTIONS, metavar="SECTION",
@@ -11271,36 +11444,79 @@ def dev_args(main_args, words: List[str], parser: argparse.ArgumentParser) -> ar
 def section_args(main_args, parser: argparse.ArgumentParser, command: str, **extra) -> argparse.Namespace:
     args = dev_args(main_args, [command], parser)
     args.all = main_args.verbose
+    args.section = True
     for key, value in extra.items():
         setattr(args, key, value)
     return args
 
 
-def run_section(fn, args) -> Tuple[Dict, str, int]:
-    """Run one section command, capturing its JSON payload or its table text."""
+class SectionStdout:
+    """Stands in for sys.stdout while sections run in threads: each thread writes to its own buffer."""
+
+    def __init__(self, real):
+        self.real = real
+        self.local = threading.local()
+
+    def capture(self, buf: io.StringIO) -> None:
+        self.local.buf = buf
+
+    def release(self) -> None:
+        self.local.buf = None
+
+    def write(self, text: str) -> int:
+        return (getattr(self.local, "buf", None) or self.real).write(text)
+
+    def flush(self) -> None:
+        (getattr(self.local, "buf", None) or self.real).flush()
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def run_section(fn, args, out: SectionStdout, threaded: bool = False) -> Tuple[Dict, str, int, Dict[str, int]]:
+    """Run one section command, capturing its JSON payload or its table text and its counts.
+
+    A threaded section holds the root gate so the process scan cannot swap the module
+    root (sysroot_override, for container processes) under it.
+    """
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        code = fn(args)
+    _section_state.counts = {}
+    out.capture(buf)
+    try:
+        with _root_gate.reading() if threaded else contextlib.nullcontext():
+            code = fn(args)
+    finally:
+        out.release()
     text = buf.getvalue()
     if args.json:
-        return json.loads(text), "", code
-    return {}, text, code
+        return json.loads(text), "", code, section_counts()
+    return {}, text, code, section_counts()
 
 
 def section_counts() -> Dict[str, int]:
-    return {level: _last_counts.get(level, 0) for level in ("critical", "medium", "low", "info")}
+    counts = getattr(_section_state, "counts", {})
+    return {level: counts.get(level, 0) for level in ("critical", "medium", "low", "info", "yours")}
+
+
+THREADED_SECTIONS = ("aur", "persist", "kernel")
 
 
 def run_all(args) -> Tuple[Dict, Dict, int]:
-    """Every section in order; returns ({section: payload or text}, summary, exit code)."""
+    """Every section, printed in a fixed order; returns ({section: payload or text}, summary, exit code).
+
+    aur, persist and kernel run in threads while the process scan runs on the main
+    thread; stale and hidden follow on the main thread (the pid probe is CPU-bound).
+    """
     parser = build_dev_parser()
     sections: Dict[str, object] = {}
-    summary = {"critical": 0, "medium": 0, "low": 0, "info": 0}
+    summary = {"critical": 0, "medium": 0, "low": 0, "info": 0, "yours": 0}
     exit_code = 0
     if "aur" not in getattr(args, "skip", None or []):
         chosen = maybe_offer_campaign_update(args)
         if chosen is not None:
             args.campaigns = str(chosen)
+        else:
+            args.no_prompt = True
     plan = [
         ("processes", cmd_scan, "Processes", {}),
         ("aur", cmd_aur, "AUR packages", {}),
@@ -11310,30 +11526,43 @@ def run_all(args) -> Tuple[Dict, Dict, int]:
         ("hidden", cmd_hidden, "Hidden processes", {}),
     ]
     command = {"processes": "scan", "stale": "restart-needed"}
-    for name, fn, title, extra in plan:
-        if name in args.skip:
-            continue
-        if name != "processes":
-            extra = dict(extra, prometheus=None)
-        sub = section_args(args, parser, command.get(name, name), **extra)
-        _last_counts.clear()
-        payload, text, code = run_section(fn, sub)
-        counts = section_counts()
-        for level in summary:
-            summary[level] += counts[level]
-        exit_code = 3 if 3 in (exit_code, code) else max(exit_code, code)
-        if args.json:
-            sections[name] = payload
-        elif name != "stale" or code:
-            print(f"\n== {title} ==\n")
-            print(text.rstrip("\n"))
+    plan = [(name, fn, title, extra if name == "processes" else dict(extra, prometheus=None))
+            for name, fn, title, extra in plan if name not in args.skip]
+    # shared caches are filled once here, before any section runs in a thread
+    file_package_cache.build()
+    real = sys.stdout
+    out = SectionStdout(real)
+    sys.stdout = out
+    try:
+        with ThreadPoolExecutor(max_workers=len(THREADED_SECTIONS)) as pool:
+            futures = {name: pool.submit(run_section, fn, section_args(args, parser, command.get(name, name), **extra),
+                                         out, True) for name, fn, title, extra in plan if name in THREADED_SECTIONS}
+            for name, fn, title, extra in plan:
+                if name in futures:
+                    payload, text, code, counts = futures[name].result()
+                else:
+                    payload, text, code, counts = run_section(fn, section_args(args, parser, command.get(name, name), **extra), out)
+                for level in summary:
+                    summary[level] += counts[level]
+                exit_code = 3 if 3 in (exit_code, code) else max(exit_code, code)
+                if args.json:
+                    sections[name] = payload
+                elif name != "stale" or code:
+                    print(("" if not sections else "\n") + f"== {title} ==\n")
+                    print(text.rstrip("\n"))
+                    sections[name] = text
+    finally:
+        sys.stdout = real
     summary["exit_code"] = exit_code
     return sections, summary, exit_code
 
 
 def summary_line(summary: Dict) -> str:
-    return (f"summary: {summary['critical']} critical, {summary['medium']} medium, {summary['low']} low, "
-            f"{summary['info']} info across all sections (exit {summary['exit_code']})")
+    look = summary["critical"] + summary["medium"] + summary["low"]
+    yours = "entry is" if summary["yours"] == 1 else "entries are"
+    return (f"summary: {look} to look at ({summary['critical']} critical, {summary['medium']} medium, "
+            f"{summary['low']} low), {summary['yours']} {yours} your own unpackaged software, "
+            f"{summary['info']} info (exit {summary['exit_code']})")
 
 
 def cmd_all(args) -> int:
