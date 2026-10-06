@@ -67,14 +67,14 @@ class EntryPoint(unittest.TestCase):
             shutil.copy2(REPO / "man" / "weird.1", pkg / "weird.1")
             shutil.copy2(REPO / "weird_cli" / "__init__.py", pkg / "__init__.py")
             code = "import sys; sys.path.insert(0, %r); import weird_cli; weird_cli.main()" % str(pkg.parent)
-            r = subprocess.run([sys.executable, "-c", code, "self-check", "--json"],
+            r = subprocess.run([sys.executable, "-c", code, "dev", "self-check", "--json"],
                                capture_output=True, text=True, env={**os.environ, "HOME": tmp})
             self.assertEqual(r.returncode, 0, r.stderr)
             info = json.loads(r.stdout)["self_integrity"]
             self.assertEqual(info["status"], "match", info)
             self.assertEqual(info["path"], str(pkg / "weird"))
             self.assertEqual(info["pin_file"], str(pkg / "package.json"))
-            r = subprocess.run([sys.executable, "-c", code, "man"], capture_output=True, text=True,
+            r = subprocess.run([sys.executable, "-c", code, "dev", "man"], capture_output=True, text=True,
                                env={**os.environ, "HOME": tmp, "PATH": tmp})
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn(".TH WEIRD 1", r.stdout)
@@ -85,7 +85,7 @@ class Completions(unittest.TestCase):
     def setUpClass(cls):
         cls.sandbox = tempfile.TemporaryDirectory(prefix="weird-completions-")
         cls.weird = load_weird(Path(cls.sandbox.name) / "home")
-        cls.parser = cls.weird.build_parser()
+        cls.parser = cls.weird.build_parser(with_verbs=True)
         cls.bash = cls.weird._bash_completion(cls.parser)
         cls.fish = cls.weird._fish_completion(cls.parser)
 
@@ -107,8 +107,8 @@ class Completions(unittest.TestCase):
             self.assertIn(f"-l {opt[2:]} ", self.fish)
 
     def test_nested_options_stay_under_their_parent(self):
-        self.assertIn('"rules init") words="-h --help --force"', self.bash)
-        self.assertIn('__fish_seen_subcommand_from rules; and __fish_seen_subcommand_from init" -l force', self.fish)
+        self.assertIn('"dev rules init") words="-h --help --force"', self.bash)
+        self.assertIn('__fish_seen_subcommand_from dev; and __fish_seen_subcommand_from rules; and __fish_seen_subcommand_from init" -l force', self.fish)
         self.assertNotIn('__fish_seen_subcommand_from baseline; and __fish_seen_subcommand_from init', self.fish)
 
     def test_file_options_complete_paths(self):
@@ -118,7 +118,7 @@ class Completions(unittest.TestCase):
 
     def test_subcommand_prints_them(self):
         for shell, marker in (("bash", "complete -F _weird weird"), ("fish", "complete -c weird -f")):
-            r = run_cli(["completions", shell])
+            r = run_cli(["dev", "completions", shell])
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn(marker, r.stdout)
 
@@ -132,7 +132,7 @@ class Completions(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".fish", delete=False) as f:
             f.write(self.fish)
         self.addCleanup(os.unlink, f.name)
-        r = subprocess.run(["fish", "-c", f"source {f.name}; complete -C 'weird rules '"],
+        r = subprocess.run(["fish", "-c", f"source {f.name}; complete -C 'weird dev rules '"],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("show", r.stdout)
@@ -145,7 +145,7 @@ class Documents(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sandbox = tempfile.TemporaryDirectory(prefix="weird-docs-")
-        cls.parser = load_weird(Path(cls.sandbox.name) / "home").build_parser()
+        cls.parser = load_weird(Path(cls.sandbox.name) / "home").build_parser(with_verbs=True)
         cls.commands = command_tree(cls.parser)
         cls.man = (REPO / "man" / "weird.1").read_text().replace("\\-", "-").replace("\\f", "")
         cls.man = re.sub(r"[BIR](?=[a-z-])", "", cls.man)
@@ -155,11 +155,19 @@ class Documents(unittest.TestCase):
     def tearDownClass(cls):
         cls.sandbox.cleanup()
 
-    def test_help_lists_every_subcommand(self):
+    def test_help_lists_verbs_and_dev_help_lists_the_rest(self):
         r = run_cli(["--help"])
         self.assertEqual(r.returncode, 0)
+        self.assertLess(len(r.stdout.splitlines()), 45)
         for name in self.commands:
             self.assertIn(name.split()[0], r.stdout, name)
+        for leaf in ("rules", "cache", "baseline", "fixture", "self-check", "falco-rules", "completions"):
+            self.assertNotIn(leaf, r.stdout)
+        r = run_cli(["dev", "--help"])
+        self.assertEqual(r.returncode, 0)
+        for name in self.commands:
+            if name.startswith("dev "):
+                self.assertIn(name.split()[1], r.stdout, name)
 
     def test_man_page_lists_every_subcommand_and_option(self):
         for name, sub in self.commands.items():
@@ -172,9 +180,10 @@ class Documents(unittest.TestCase):
     def test_readme_commands_table_lists_every_subcommand(self):
         section = self.readme.split("## Commands", 1)[1].split("\n## ", 1)[0]
         for name in self.commands:
-            if name in ("rules show", "rules init", "fixture record"):
+            if name.count(" ") > 1 or name.startswith("dev"):
                 continue
             self.assertIn(f"`weird {name}", section, name)
+        self.assertIn("`weird dev", section)
         self.assertLess(self.readme.count("\n"), 260, "README should stay short; long reference goes in docs/")
         self.assertNotIn("\u2014", self.readme)
 

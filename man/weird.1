@@ -3,68 +3,29 @@
 weird \- process anomaly detector for Linux
 .SH SYNOPSIS
 .B weird
-[\fB\-v\fR] [\fB\-a\fR] [\fB\-\-net\fR] [\fB\-\-net\-outbound\-only\fR]
-[\fB\-\-include\-listen\fR] [\fB\-\-enrich\-net\fR] [\fB\-\-deep\fR]
-[\fB\-\-json\fR | \fB\-\-ndjson\fR]
+[\fB\-v\fR] [\fB\-\-deep\fR] [\fB\-\-json\fR | \fB\-\-ndjson\fR]
 [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
-[\fB\-\-log\-file\fR \fIFILE\fR]
-[\fB\-\-raw\-cmdline\fR]
-[\fB\-\-debug\-log\fR \fIFILE\fR]
+[\fB\-\-skip\fR \fISECTION\fR]... [\fB\-\-offline\fR \fISYSROOT\fR]
+[\fB\-\-no\-prompt\fR]
 [\fB\-\-proc\-root\fR \fIDIR\fR] [\fB\-\-sysroot\fR \fIDIR\fR]
 .br
 .B weird
+\fIPID\fR | \fIPATH\fR
+.br
+.B weird trust
+\fIPID\fR | \fIPATH\fR
+.br
+.B weird untrust
+\fIPATH\fR
+.br
+.B weird watch
+[\fB\-\-poll\fR \fISECONDS\fR] [\fB\-\-events\fR \fIPATH\fR] [\fB\-\-follow\fR | \fB\-\-no\-follow\fR] [\fB\-\-falco\fR] [\fB\-\-journal\fR]
+.br
+.B weird dev
+\fICOMMAND\fR [\fIoptions\fR]
+.br
+.B weird
 \fB\-\-version\fR
-.br
-.B weird
-\fBinspect\fR \fIPID\fR
-.br
-.B weird
-\fBtrust\fR \fINAME_OR_PATH\fR
-.br
-.B weird
-\fBrules\fR [\fBshow\fR [\fB\-\-defaults\fR] | \fBinit\fR [\fB\-\-force\fR]]
-.br
-.B weird
-\fBcache\fR [\fB\-\-rebuild\fR]
-.br
-.B weird
-\fBbaseline\fR \fBinit\fR | \fBshow\fR | \fBdiff\fR | \fBtrust\fR \fIPID_OR_PATH\fR | \fBuntrust\fR \fIPATH\fR
-.br
-.B weird
-\fBrestart\-needed\fR [\fB\-\-json\fR]
-.br
-.B weird
-\fBpersist\fR [\fB\-\-all\fR] [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
-.br
-.B weird
-\fBhidden\fR [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
-.br
-.B weird
-\fBkernel\fR [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
-.br
-.B weird
-\fBaur\fR [\fB\-\-all\fR] [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR] [\fB\-\-pkgbuild\-dir\fR \fIDIR\fR]
-.br
-.B weird
-\fBself\-check\fR [\fB\-\-json\fR]
-.br
-.B weird
-\fBoffline\fR \fISYSROOT\fR [\fB\-\-force\fR] [\fB\-\-limit\fR \fIN\fR] [\fB\-\-json\fR] [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR] [\fB\-\-pkgbuild\-dir\fR \fIDIR\fR]
-.br
-.B weird
-\fBfixture record\fR \fIPID\fR \fIDIR\fR
-.br
-.B weird
-\fBwatch\fR [\fB\-\-poll\fR \fISECONDS\fR] [\fB\-\-events\fR \fIPATH\fR] [\fB\-\-follow\fR | \fB\-\-no\-follow\fR] [\fB\-\-falco\fR] [\fB\-\-journal\fR]
-.br
-.B weird
-\fBfalco\-rules\fR
-.br
-.B weird
-\fBman\fR
-.br
-.B weird
-\fBcompletions\fR \fBbash\fR | \fBfish\fR
 .SH DESCRIPTION
 .B weird
 scans running processes and highlights suspicious behavior and unclear provenance.
@@ -208,8 +169,42 @@ Enable with \fB--debug-log FILE\fR or WEIRD_DEBUG_LOG to troubleshoot failures.
 .SH COMMANDS
 .TP
 .B (default)
-Scan for suspicious processes. Shows a table and (by default) detail for
-high\-score and unknown trust levels.
+One run, one report. Sections in order: self\-check lines when something is wrong,
+process scan, AUR packages (foreign package list, known\-bad cross\-check, PKGBUILD
+analysis), persistence entries, kernel posture and findings, stale binaries (only
+when a process still runs a replaced file), hidden process cross\-views (the slow
+pid probe). Ends with a summary line of counts by severity across every section.
+Exit status 2 if any critical, 1 if any medium or warning, 0 otherwise, 3 when a
+collector failed. \fB\-\-skip\fR \fISECTION\fR leaves a section out (processes,
+aur, persist, kernel, stale, hidden; repeatable). \fB\-\-json\fR prints one object
+with a key per section plus "summary". \fB\-\-offline\fR \fISYSROOT\fR runs the
+live\-media checks (persist, integrity, aur) against a mounted disk with no process
+or hidden sections. \fB\-\-no\-prompt\fR is accepted and reserved.
+.TP
+.B \fIPID\fR | \fIPATH\fR
+A number inspects that process (provenance, integrity, mappings, environment,
+sockets, tree); an existing path shows its owner package, integrity and the
+processes running it.
+.TP
+.B trust \fIPID\fR | \fIPATH\fR
+Record the sha256 of an executable so scans stay quiet about it until the file
+changes; \fBuntrust\fR \fIPATH\fR removes the entry.
+.TP
+.B watch
+One NDJSON line per new flagged process: from the weird\-sensor events file when
+it is fresh (\fB\-\-events\fR \fIPATH\fR, \fB\-\-follow\fR, \fB\-\-no\-follow\fR),
+else by polling /proc (\fB\-\-poll\fR \fISECONDS\fR); \fB\-\-falco\fR runs Falco.
+.TP
+.B dev
+Developer and single\-section commands, listed by \fBweird dev \-\-help\fR and
+below. They take the old scan flags (\fB\-a\fR, \fB\-\-net\fR,
+\fB\-\-net\-outbound\-only\fR, \fB\-\-include\-listen\fR, \fB\-\-enrich\-net\fR,
+\fB\-\-log\-file\fR, \fB\-\-raw\-cmdline\fR, \fB\-\-debug\-log\fR).
+.SH DEV COMMANDS
+Each one is \fBweird dev\fR \fINAME\fR.
+.TP
+.B scan
+The process scan section on its own (the old default command).
 .TP
 .B inspect \fIPID\fR
 Show a detailed inspection of a specific process, including open files and a
@@ -550,7 +545,7 @@ Baseline data.
 .B ~/.config/weird/trusted.json
 Trusted executable hashes written by \fBweird baseline trust\fR (0600).
 .TP
-.B systemd/weird.service, weird.timer, weird\-persist.service, weird\-persist.timer
+.B systemd/weird.service, weird.timer
 Shipped user units for a daily scan and persistence check.
 .SH EXIT STATUS
 .TP

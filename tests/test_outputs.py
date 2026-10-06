@@ -26,8 +26,8 @@ MEMFD_MAPS = [
     "7ffd0d3e5000-7ffd0d406000 rw-p 00000000 00:00 0                          [stack]",
 ]
 UNIT_DIR = REPO / "systemd"
-SERVICES = ("weird.service", "weird-persist.service")
-TIMERS = ("weird.timer", "weird-persist.timer")
+SERVICES = ("weird.service",)
+TIMERS = ("weird.timer",)
 
 
 class OutputBox(ArchBox):
@@ -201,7 +201,6 @@ class UnitFiles(unittest.TestCase):
                 self.assertIn(flag, exec_start, name)
             self.assertEqual(cp["Service"]["SuccessExitStatus"], "1 2", name)
             self.assertIn("SyslogIdentifier", cp["Service"], name)
-        self.assertIn("weird persist", self.parse("weird-persist.service")["Service"]["ExecStart"])
         self.assertIn("/var/lib/node_exporter/textfile_collector", (UNIT_DIR / "weird.service").read_text())
 
     def test_timer_units(self):

@@ -120,12 +120,12 @@ class FixtureRecord(unittest.TestCase):
         path = self.decoy("weird-fx-cli")
         proc = self.start([path, "300"], {"HOME": str(self.home), "PATH": "/usr/bin:/bin"})
         fixture = Path(self.sandbox.name) / "cli-fixture"
-        r = run_cli(["fixture", "record", str(proc.pid), str(fixture)], home=self.home, timeout=120)
+        r = run_cli(["dev", "fixture", "record", str(proc.pid), str(fixture)], home=self.home, timeout=120)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(f"recorded pid {proc.pid} into {fixture}", r.stdout)
         self.assertIn(f"replay: weird --proc-root {fixture} --sysroot {fixture}/sysroot -v", r.stdout)
         self.assertTrue((fixture / str(proc.pid) / "status").is_file())
-        r = run_cli(["fixture", "record", "999999999", str(fixture)], home=self.home, timeout=60)
+        r = run_cli(["dev", "fixture", "record", "999999999", str(fixture)], home=self.home, timeout=60)
         self.assertEqual(r.returncode, 1)
         self.assertIn("not found", r.stderr)
 

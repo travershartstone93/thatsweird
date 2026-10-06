@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import csv
 import glob
 import gzip
@@ -6172,7 +6173,7 @@ def cmd_baseline_trust(args) -> int:
     """weird baseline trust <pid|path>: record the executable hash in trusted.json."""
     target = getattr(args, "target", None)
     if not target:
-        print("Usage: weird baseline trust <pid|path>")
+        print("Usage: weird trust <pid|path>")
         return 1
     entry, error = resolve_trust_target(target)
     if not entry:
@@ -6192,7 +6193,7 @@ def cmd_baseline_untrust(args) -> int:
     """weird baseline untrust <path>: drop every trusted entry for that executable."""
     target = getattr(args, "target", None)
     if not target:
-        print("Usage: weird baseline untrust <path>")
+        print("Usage: weird untrust <path>")
         return 1
     realpath = os.path.realpath(target)
     entries = load_trusted()
@@ -6560,6 +6561,8 @@ def cmd_scan(args) -> int:
 
     started = time.monotonic()
     processes, alerts, exit_code = run_scan(args)
+    note_counts({"critical": sum(1 for a in alerts if a.get("severity") == "critical"),
+                 "medium": sum(1 for a in alerts if a.get("severity") != "critical")})
     if getattr(args, "journal", False):
         journal_alerts(processes, alerts)
     if getattr(args, "prometheus", None):
@@ -6655,8 +6658,29 @@ def cmd_scan(args) -> int:
     return exit_code
 
 
+def cmd_inspect_path(path: str) -> int:
+    """weird PATH: provenance and integrity of one file, and the processes running it."""
+    real = os.path.realpath(path)
+    file_package_cache.build()
+    trust, info = verify_package_provenance(real)
+    print(f"Path:        {path}" + (f" -> {real}" if real != path else ""))
+    print(f"Trust:       {trust.name}")
+    if info.package:
+        print(f"Package:     {info.package} {info.version}".rstrip())
+    if info.manager:
+        print(f"Manager:     {info.manager}")
+    if info.package and info.manager:
+        status, detail = verify_integrity(real, info.package, info.manager)
+        print(f"Integrity:   {status} ({detail})")
+    running = [p for p in get_processes() if p.path == real]
+    print(f"Running:     " + (", ".join(f"{p.pid} ({p.name})" for p in running) if running else "no process"))
+    return 0
+
+
 def cmd_inspect(args) -> int:
     """Inspect a specific PID."""
+    if getattr(args, "path", None):
+        return cmd_inspect_path(args.path)
     pid = args.pid
 
     # Build cache
@@ -7314,6 +7338,7 @@ def cmd_restart_needed(args) -> int:
     """List processes still running files a package upgrade replaced, grouped by systemd unit."""
     stale = find_stale_processes()
     groups = group_stale_by_unit(stale)
+    note_counts({"medium": len(stale)})
     if args.json:
         payload = {
             "host": socket.gethostname(),
@@ -7908,6 +7933,7 @@ def cmd_persist(args) -> int:
     warnings = self_check()
     entries = collect_persistence()
     counts = persist_counts(entries)
+    note_counts(counts)
     code = persist_exit_code(entries)
     emit_findings_outputs(args, "persist", persist_findings(entries), started)
     if args.json:
@@ -7923,7 +7949,7 @@ def cmd_persist(args) -> int:
         return code
     print_self_check(warnings)
 
-    show_all = getattr(args, "all", False)
+    show_all = getattr(args, "all", False) or getattr(args, "verbose", False)
     shown = [e for e in entries if show_all or e.severity != "info"]
     if shown:
         header = f"{'SOURCE':<16} {'FILE':<40} {'TARGET':<36} {'TRUST':<12} SEVERITY"
@@ -7939,7 +7965,7 @@ def cmd_persist(args) -> int:
                       + (f" [{entry.attack}]" if entry.attack else ""))
     else:
         print("Every persistence entry launches a packaged, intact executable.")
-    tail = "" if show_all or not counts["info"] else " (--all lists the info entries)"
+    tail = "" if show_all or not counts["info"] else " (-v lists the info entries)"
     print(f"\n{counts['total']} persistence entries checked: {counts['critical']} critical, "
           f"{counts['medium']} medium, {counts['info']} info{tail}")
     return code
@@ -7965,6 +7991,15 @@ class Finding:
 
 def sort_findings(findings: List[Finding]) -> None:
     findings.sort(key=lambda f: (FINDING_SEVERITY_ORDER[f.severity], f.subject, f.kind, f.detail))
+
+
+_last_counts: Dict[str, int] = {}
+
+
+def note_counts(counts: Dict[str, int]) -> None:
+    """Severity counts of the section that just ran, read by the combined report."""
+    _last_counts.clear()
+    _last_counts.update(counts)
 
 
 def finding_counts(findings: List[Finding]) -> Dict[str, int]:
@@ -8006,6 +8041,8 @@ def print_findings(findings: List[Finding], explanations: Optional[Dict[str, str
 
 
 def print_self_check(warnings: List[str]) -> None:
+    if _self_check_shown:
+        return
     for warning in warnings:
         print(f"{YELLOW}WARNING (self-check): {warning}{RESET}")
     if warnings:
@@ -8417,6 +8454,7 @@ def cmd_hidden(args) -> int:
     if load:
         findings.append(load)
     sort_findings(findings)
+    note_counts(finding_counts(findings))
     code = findings_exit_code(findings)
     emit_findings_outputs(args, "hidden", findings, started)
 
@@ -8797,6 +8835,7 @@ def cmd_kernel(args) -> int:
     findings += posture_findings(posture)
     findings += ebpf_findings()
     sort_findings(findings)
+    note_counts(finding_counts(findings))
     code = findings_exit_code(findings)
     summary["taint"] = taint
     summary["taint_flags"] = [text for _, text in decode_taint(taint or 0)]
@@ -9159,6 +9198,7 @@ def cmd_aur(args) -> int:
     packages = check_aur_packages(getattr(args, "pkgbuild_dir", None))
     findings = [f for pkg in packages for f in pkg.findings]
     sort_findings(findings)
+    note_counts(finding_counts(findings))
     code = findings_exit_code(findings)
     emit_findings_outputs(args, "aur", findings, started)
 
@@ -9173,7 +9213,7 @@ def cmd_aur(args) -> int:
     if not packages:
         print("No foreign packages installed.")
         return 0
-    show_all = getattr(args, "all", False)
+    show_all = getattr(args, "all", False) or getattr(args, "verbose", False)
     shown = [f for f in findings if show_all or f.severity != "info"]
     if shown:
         print_findings(shown, AUR_EXPLANATIONS, subject_header="PACKAGE")
@@ -9181,7 +9221,7 @@ def cmd_aur(args) -> int:
         print("Every checked PKGBUILD fetches over https with checksums and has not changed since install.")
     checked = sum(1 for p in packages if p.pkgbuild)
     counts = finding_counts(findings)
-    tail = "" if show_all or not counts["info"] else " (--all lists the info entries)"
+    tail = "" if show_all or not counts["info"] else " (-v lists the info entries)"
     print(f"\n{len(packages)} foreign packages, {checked} PKGBUILDs checked: {counts['critical']} critical, "
           f"{counts['medium']} medium, {counts['low']} low, {counts['info']} info{tail}")
     return code
@@ -9717,9 +9757,11 @@ def cmd_completions(args, parser: argparse.ArgumentParser) -> int:
 # Main
 # =============================================================================
 
-def build_parser() -> argparse.ArgumentParser:
+def build_dev_parser() -> argparse.ArgumentParser:
+    """The old command tree, kept under `weird dev` for scripts and tests."""
     parser = argparse.ArgumentParser(
-        description="Process Anomaly Detector - Identify suspicious processes",
+        prog="weird dev",
+        description="Developer and single-section commands of weird (the plain `weird` runs them all)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 SECURITY WARNING:
@@ -9805,7 +9847,38 @@ Examples:
                        default=os.environ.get("WEIRD_SYSROOT"),
                        help="Prefix for package databases and system config (offline analysis, tests)")
 
+    add_dev_commands(parser)
+    return parser
+
+
+def add_watch_arguments(watch_parser: argparse.ArgumentParser) -> None:
+
+    watch_parser.add_argument("--poll", type=float, default=None, metavar="SECONDS",
+                              help="Seconds between /proc scans (default 2); given explicitly it also turns off "
+                                   "the automatic switch to the sensor's events file")
+    watch_parser.add_argument("--events", metavar="PATH",
+                              help="Read weird-sensor NDJSON events from PATH instead of polling (chosen "
+                                   f"automatically when {SENSOR_EVENTS_FILE} was written in the last "
+                                   f"{SENSOR_FRESH_SECONDS} s)")
+    watch_parser.add_argument("--follow", dest="follow", action="store_true", default=None,
+                              help="Keep tailing the events file after end of file (default for paths under /run)")
+    watch_parser.add_argument("--no-follow", dest="follow", action="store_false",
+                              help="Stop at end of file (default for paths elsewhere)")
+    watch_parser.add_argument("--falco", action="store_true",
+                              help="Run Falco in the foreground with the weird rules instead of polling "
+                                   "(needs /usr/bin/falco and sudo)")
+    watch_parser.add_argument("--journal", action="store_true", default=argparse.SUPPRESS,
+                              help="Send each alert and finding to the systemd journal")
+
+
+WATCH_HELP = ("Print one NDJSON line per new flagged process: from the weird-sensor events file when it is fresh, "
+              "else by polling /proc (--falco runs Falco instead)")
+
+
+def add_dev_commands(parser: argparse.ArgumentParser) -> None:
     subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("scan", help="Process scan only (the first section of a plain `weird` run)")
 
     # inspect subcommand
     inspect_parser = subparsers.add_parser("inspect", help="Detailed inspection of a PID")
@@ -9828,27 +9901,7 @@ Examples:
     cache_parser.add_argument("--rebuild", action="store_true",
                              help="Force rebuild the cache")
 
-    # watch subcommand
-    watch_parser = subparsers.add_parser(
-        "watch",
-        help="Print one NDJSON line per new flagged process: from the weird-sensor events file when it is fresh, "
-             "else by polling /proc (--falco runs Falco instead)")
-    watch_parser.add_argument("--poll", type=float, default=None, metavar="SECONDS",
-                              help="Seconds between /proc scans (default 2); given explicitly it also turns off "
-                                   "the automatic switch to the sensor's events file")
-    watch_parser.add_argument("--events", metavar="PATH",
-                              help="Read weird-sensor NDJSON events from PATH instead of polling (chosen "
-                                   f"automatically when {SENSOR_EVENTS_FILE} was written in the last "
-                                   f"{SENSOR_FRESH_SECONDS} s)")
-    watch_parser.add_argument("--follow", dest="follow", action="store_true", default=None,
-                              help="Keep tailing the events file after end of file (default for paths under /run)")
-    watch_parser.add_argument("--no-follow", dest="follow", action="store_false",
-                              help="Stop at end of file (default for paths elsewhere)")
-    watch_parser.add_argument("--falco", action="store_true",
-                              help="Run Falco in the foreground with the weird rules instead of polling "
-                                   "(needs /usr/bin/falco and sudo)")
-    watch_parser.add_argument("--journal", action="store_true", default=argparse.SUPPRESS,
-                              help="Send each alert and finding to the systemd journal")
+    add_watch_arguments(subparsers.add_parser("watch", help=WATCH_HELP))
 
     def output_flags(sub) -> None:
         sub.add_argument("--journal", action="store_true", default=argparse.SUPPRESS,
@@ -9960,19 +10013,8 @@ Examples:
     return parser
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-    set_roots(args.proc_root, args.sysroot)
-    check_self_integrity()
-
-    # Set up debug logging if requested
-    global DEBUG_LOG_FILE
-    if getattr(args, 'debug_log', None):
-        DEBUG_LOG_FILE = Path(args.debug_log)
-        debug_log("startup", f"Debug logging enabled to {DEBUG_LOG_FILE}")
-
-    # Dispatch to command handler
+def dev_main(args, parser: argparse.ArgumentParser) -> int:
+    """Dispatch for the dev command tree (and the verbs that reuse it)."""
     if args.command == "inspect":
         return cmd_inspect(args)
     elif args.command == "trust":
@@ -10016,6 +10058,212 @@ def main():
         return cmd_scan(args)
     else:
         return cmd_scan(args)
+
+
+SECTIONS = ("processes", "aur", "persist", "kernel", "stale", "hidden")
+VERBS = ("dev", "trust", "untrust", "watch")
+VALUE_OPTIONS = ("--skip", "--prometheus", "--offline", "--proc-root", "--sysroot", "--log-file", "--debug-log")
+_self_check_shown = False
+
+
+def build_parser(with_verbs: bool = False) -> argparse.ArgumentParser:
+    """The one-command parser. with_verbs adds the verb tree (completions and docs only)."""
+    parser = argparse.ArgumentParser(
+        prog="weird",
+        usage="weird [options]\n       weird PID | PATH\n       weird trust PID|PATH\n       weird untrust PATH\n"
+              "       weird watch [--poll S | --events PATH | --falco]",
+        description=textwrap.fill(
+            "One run, one report: process scan, AUR packages, persistence entries, kernel posture, "
+            "stale binaries and hidden-process cross-views, with a summary line and one exit code "
+            "(0 clean, 1 medium or warning, 2 critical, 3 a collector failed). Trust levels mean "
+            "provenance, not security.", 78),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.fill(
+            "weird PID or weird PATH inspects one process or file; weird trust pins an executable so scans "
+            "stay quiet until it changes; weird watch streams new flagged processes.", 78)
+            + "\nDeveloper and single-section commands live under `weird dev` (weird dev --help).")
+    parser.add_argument("target", nargs="?", metavar="PID|PATH", help=argparse.SUPPRESS)
+    parser.add_argument("--version", action="version", version=f"weird {__version__}")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="All processes, info rows and the notes behind each finding")
+    parser.add_argument("--json", action="store_true", help="One JSON object, a key per section plus summary")
+    parser.add_argument("--ndjson", action="store_true", help="One JSON line per process (scan section only)")
+    parser.add_argument("--journal", action="store_true", help="Send alerts and findings to the systemd journal")
+    parser.add_argument("--prometheus", metavar="PATH", help="Write node_exporter textfile metrics to PATH")
+    parser.add_argument("--deep", action="store_true", help="Hash every packaged executable against its package")
+    parser.add_argument("--offline", metavar="SYSROOT",
+                        help="Live-media mode: check a mounted disk (no process or hidden sections)")
+    parser.add_argument("--skip", action="append", default=[], choices=SECTIONS, metavar="SECTION",
+                        help="Leave out a section (repeatable): " + ", ".join(SECTIONS))
+    parser.add_argument("--no-prompt", dest="no_prompt", action="store_true", help="Never ask questions (reserved)")
+    parser.add_argument("--proc-root", dest="proc_root", metavar="DIR", default=os.environ.get("WEIRD_PROC_ROOT"),
+                        help="Read process info from DIR instead of /proc (replays, tests)")
+    parser.add_argument("--sysroot", dest="sysroot", metavar="DIR", default=os.environ.get("WEIRD_SYSROOT"),
+                        help="Prefix for package databases and system config (replays, tests)")
+    parser.add_argument("--debug-log", dest="debug_log", metavar="FILE", help=argparse.SUPPRESS)
+    if with_verbs:
+        verbs = parser.add_subparsers(dest="verb")
+        verbs.add_parser("trust", help="Pin an executable hash").add_argument("target")
+        verbs.add_parser("untrust", help="Remove a pinned executable").add_argument("target")
+        add_watch_arguments(verbs.add_parser("watch", help=WATCH_HELP))
+        add_dev_commands(verbs.add_parser("dev", help="Developer and single-section commands"))
+    return parser
+
+
+def split_argv(argv: List[str]) -> Tuple[List[str], Optional[str], List[str]]:
+    """Main flags before the first verb word, the verb, and everything after it."""
+    skip_value = False
+    for i, word in enumerate(argv):
+        if skip_value:
+            skip_value = False
+            continue
+        if word in VALUE_OPTIONS:
+            skip_value = True
+            continue
+        if word.startswith("-"):
+            continue
+        if word in VERBS:
+            return argv[:i], word, argv[i + 1:]
+        break
+    return argv, None, []
+
+
+def dev_args(main_args, words: List[str], parser: argparse.ArgumentParser) -> argparse.Namespace:
+    """Parse words with the dev parser and carry the main flags over."""
+    args, extra = parser.parse_known_args(words)
+    if extra:
+        parser.parse_args(extra, namespace=args)
+    for key in ("verbose", "json", "ndjson", "journal", "prometheus", "deep", "proc_root", "sysroot", "debug_log"):
+        if getattr(main_args, key, None) and not getattr(args, key, None):
+            setattr(args, key, getattr(main_args, key))
+    return args
+
+
+def section_args(main_args, parser: argparse.ArgumentParser, command: str, **extra) -> argparse.Namespace:
+    args = dev_args(main_args, [command], parser)
+    args.all = main_args.verbose
+    for key, value in extra.items():
+        setattr(args, key, value)
+    return args
+
+
+def run_section(fn, args) -> Tuple[Dict, str, int]:
+    """Run one section command, capturing its JSON payload or its table text."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = fn(args)
+    text = buf.getvalue()
+    if args.json:
+        return json.loads(text), "", code
+    return {}, text, code
+
+
+def section_counts() -> Dict[str, int]:
+    return {level: _last_counts.get(level, 0) for level in ("critical", "medium", "low", "info")}
+
+
+def run_all(args) -> Tuple[Dict, Dict, int]:
+    """Every section in order; returns ({section: payload or text}, summary, exit code)."""
+    parser = build_dev_parser()
+    sections: Dict[str, object] = {}
+    summary = {"critical": 0, "medium": 0, "low": 0, "info": 0}
+    exit_code = 0
+    plan = [
+        ("processes", cmd_scan, "Processes", {}),
+        ("aur", cmd_aur, "AUR packages", {}),
+        ("persist", cmd_persist, "Persistence", {}),
+        ("kernel", cmd_kernel, "Kernel", {}),
+        ("stale", cmd_restart_needed, "Stale binaries (restart needed)", {"prometheus": None, "journal": False}),
+        ("hidden", cmd_hidden, "Hidden processes", {}),
+    ]
+    command = {"processes": "scan", "stale": "restart-needed"}
+    for name, fn, title, extra in plan:
+        if name in args.skip:
+            continue
+        if name != "processes":
+            extra = dict(extra, prometheus=None)
+        sub = section_args(args, parser, command.get(name, name), **extra)
+        _last_counts.clear()
+        payload, text, code = run_section(fn, sub)
+        counts = section_counts()
+        for level in summary:
+            summary[level] += counts[level]
+        exit_code = 3 if 3 in (exit_code, code) else max(exit_code, code)
+        if args.json:
+            sections[name] = payload
+        elif name != "stale" or code:
+            print(f"\n== {title} ==\n")
+            print(text.rstrip("\n"))
+    summary["exit_code"] = exit_code
+    return sections, summary, exit_code
+
+
+def summary_line(summary: Dict) -> str:
+    return (f"summary: {summary['critical']} critical, {summary['medium']} medium, {summary['low']} low, "
+            f"{summary['info']} info across all sections (exit {summary['exit_code']})")
+
+
+def cmd_all(args) -> int:
+    global _self_check_shown
+    warnings = self_check()
+    if not args.json and not args.ndjson:
+        print_self_check(warnings)
+        _self_check_shown = True
+    if args.ndjson:
+        parser = build_dev_parser()
+        return cmd_scan(section_args(args, parser, "scan"))
+    sections, summary, exit_code = run_all(args)
+    if args.json:
+        payload = {"host": socket.gethostname(), "timestamp": int(time.time()), "self_check": warnings,
+                   "self_integrity": _self_integrity}
+        payload.update(sections)
+        payload["summary"] = summary
+        print(json.dumps(payload, indent=2))
+        return exit_code
+    print()
+    print(summary_line(summary))
+    return exit_code
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    main_words, verb, rest = split_argv(argv)
+    parser = build_parser()
+    args = parser.parse_args(main_words)
+    set_roots(args.proc_root, args.sysroot)
+    check_self_integrity()
+
+    global DEBUG_LOG_FILE
+    if getattr(args, 'debug_log', None):
+        DEBUG_LOG_FILE = Path(args.debug_log)
+        debug_log("startup", f"Debug logging enabled to {DEBUG_LOG_FILE}")
+
+    dev = build_dev_parser()
+    if verb == "dev":
+        if not rest or rest == ["--help"] or rest == ["-h"]:
+            dev.print_help()
+            return 0
+        sub = dev_args(args, rest, dev)
+        if sub.command == "completions":
+            return cmd_completions(sub, build_parser(with_verbs=True))
+        return dev_main(sub, dev)
+    if verb in ("trust", "untrust"):
+        return dev_main(dev_args(args, ["baseline", verb] + rest, dev), dev)
+    if verb == "watch":
+        return dev_main(dev_args(args, ["watch"] + rest, dev), dev)
+    if args.offline:
+        sub = dev_args(args, ["offline", args.offline], dev)
+        return cmd_offline(sub)
+    if args.target is not None:
+        if args.target.isdigit():
+            sub = dev_args(args, ["inspect", args.target], dev)
+            return cmd_inspect(sub)
+        if os.path.exists(args.target):
+            sub = dev_args(args, ["inspect", "0"], dev)
+            sub.path = args.target
+            return cmd_inspect(sub)
+        parser.error(f"{args.target} is neither a pid nor an existing path")
+    return cmd_all(args)
 
 
 if __name__ == "__main__":

@@ -141,12 +141,12 @@ class Offline(OfflineBox):
 
 class OfflineCli(unittest.TestCase):
     def test_cli_refuses_root(self):
-        r = run_cli(["offline", "/"], timeout=60)
+        r = run_cli(["dev", "offline", "/"], timeout=60)
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertIn("--force", r.stderr)
 
     def test_help_mentions_live_media(self):
-        r = run_cli(["offline", "--help"], timeout=60)
+        r = run_cli(["dev", "offline", "--help"], timeout=60)
         self.assertEqual(r.returncode, 0)
         self.assertIn("--force", r.stdout)
         self.assertIn("--limit", r.stdout)

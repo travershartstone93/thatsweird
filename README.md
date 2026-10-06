@@ -24,50 +24,40 @@ package wraps it in a `weird_cli` shim so `pip install .` gives a `weird`
 console script. Shell completions are generated from the command tree:
 
 ```bash
-weird completions bash > ~/.local/share/bash-completion/completions/weird
-weird completions fish > ~/.config/fish/completions/weird.fish
+weird dev completions bash > ~/.local/share/bash-completion/completions/weird
+weird dev completions fish > ~/.config/fish/completions/weird.fish
 ```
 
 ## Quick start
 
 ```bash
-weird                # table of processes that need a look, reasons under each row
-weird -v             # every process with its trust level and score
-weird --json         # the same as JSON: processes, reasons, attack ids, verdicts, integrity
-weird inspect 1234   # one process in depth: provenance, integrity, mappings, environment, sockets, tree
+weird                # one report: processes, AUR packages, persistence, kernel, stale binaries, hidden processes
+weird -v             # every process, info rows and the notes behind each finding
+weird --json         # the same as one JSON object, a key per section plus "summary"
+weird --skip hidden  # leave out a section (repeatable); hidden is the slow pid probe
+weird 1234           # one process in depth: provenance, integrity, mappings, environment, sockets, tree
+weird /usr/bin/foo   # one file: owner package, integrity, which processes run it
 ```
 
-Exit status is 2 when something looks malicious, 1 for warnings, 0 when
-clean, 3 when a collector failed. Make the terminal wide enough for the table.
+The report ends with a summary line (counts by severity across every
+section) and the exit status is 2 when anything is critical, 1 for medium or
+warning findings, 0 when clean, 3 when a collector failed. Make the terminal
+wide enough for the table.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `weird` | Scan running processes; `-v` shows all, `--net` those with connections, `--deep` hashes every packaged binary |
-| `weird inspect PID` | Everything weird knows about one process |
-| `weird trust NAME` | Add a process name or path to the user trusted list |
-| `weird rules show \| init` | Print or write the rules.toml template; `show --defaults` prints the built-in rules |
-| `weird cache [--rebuild]` | Show or rebuild the file to package cache |
-| `weird baseline init \| show \| diff \| trust PID \| untrust PATH` | Record what runs, compare later; `trust` pins an executable's hash |
+| `weird` | The whole report; `--skip SECTION` leaves one out, `--offline SYSROOT` checks a mounted disk from live media |
+| `weird PID` or `weird PATH` | Everything weird knows about one process or one file |
+| `weird trust PID\|PATH` | Pin an executable's hash so scans stay quiet until the file changes; `weird untrust PATH` removes it |
 | `weird watch` | One NDJSON line per new flagged process; `--events PATH` reads weird-sensor, `--falco` runs Falco |
-| `weird restart-needed` | Processes still running files an upgrade replaced, grouped by systemd unit |
-| `weird persist` | What starts without you: units, cron, autostart, shell rc, ld.so.preload, udev, pacman hooks |
-| `weird hidden` | Processes, threads and sockets that one view of the kernel shows and another does not |
-| `weird kernel` | Loaded modules across three views, module ownership, taint, hardening posture |
-| `weird aur` | PKGBUILD supply chain checks behind locally built packages |
-| `weird offline SYSROOT` | Persistence, executable integrity and aur against a mounted disk, from live media |
-| `weird self-check` | Own-process checks and the script's sha256 against its pin |
-| `weird fixture record PID DIR` | Capture a live process for replay with `--proc-root DIR --sysroot DIR/sysroot` |
-| `weird falco-rules` | Print the Falco rules weird ships |
-| `weird completions bash \| fish` | Print a completion script |
-| `weird man` | Show the manual page |
+| `weird dev ...` | Everything else: single sections (`scan`, `persist`, `hidden`, `kernel`, `aur`, `restart-needed`, `self-check`), `baseline init\|show\|diff`, `rules show\|init`, `cache`, `fixture record`, `completions`, `man`, `falco-rules`; `weird dev --help` lists them |
 
-`--journal` and `--prometheus PATH` work on the scan and on `persist`,
-`hidden`, `kernel`, `aur` and `offline`. `--proc-root` and `--sysroot`
-point every reader at a recorded tree instead of the live system. The man
-page (`man/weird.1`) documents every flag; [docs/reference.md](docs/reference.md)
-has the long form of each subcommand.
+weird reads `~/.config/weird/rules.toml` for allow, suppress, upgrade,
+downgrade and tag rules (`weird dev rules init` writes the template; see
+`docs/rules.md`). The trusted list and baseline live next to it and work the
+same whichever way the sections are run.
 
 ## How it works
 
@@ -153,7 +143,7 @@ weird watch | jq -r '"\(.verdict) \(.name) pid \(.pid): \(.reasons[0])"'
 `WEIRD_VERDICT` fields (`journalctl -t weird`). `--prometheus PATH` writes a
 node_exporter textfile with `weird_alerts`, `weird_processes_total` and the
 scan timestamp and duration, renamed into place atomically. `systemd/`
-ships user timer units for a daily scan and a daily persistence check:
+ships a user timer unit for one daily `weird --json --journal` run (every section):
 
 ```bash
 systemctl --user link "$PWD/systemd/weird.service" "$PWD/systemd/weird.timer"
@@ -166,8 +156,8 @@ Boot live media, mount the suspect disk, and let a kernel the attacker does
 not control read it:
 
 ```bash
-weird offline /mnt/root          # persistence, integrity of every packaged executable, aur
-weird offline /mnt/root --json   # {sysroot, sections: {persist, integrity, aur}, findings, counts}
+weird --offline /mnt/root        # persistence, integrity of every packaged executable, aur
+weird --offline /mnt/root --json # {sysroot, sections: {persist, integrity, aur}, findings, counts}
 ```
 
 No process scan, `/` refused without `--force`, exit 2/1/0 as usual.
@@ -185,7 +175,7 @@ root. The emulation tests in `tests/test_emulation.py` are different: they
 start harmless decoys on the host (a copy of sleep named sshd under /tmp,
 a deleted executable, a memfd exec, an LD_PRELOAD of a real library, a
 ptrace attach) and prove the live scan catches each one with the expected
-reason and ATT&CK id. `weird fixture record PID DIR` captures a real
+reason and ATT&CK id. `weird dev fixture record PID DIR` captures a real
 process into a tree the suite can replay, so a scenario seen once can
 become a test without shipping anything dangerous. CI runs the suite on
 Ubuntu (Python 3.12 and 3.13) and in an Arch Linux container.

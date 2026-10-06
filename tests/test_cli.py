@@ -12,21 +12,25 @@ def run(*args, timeout=300):
 
 
 class CliTests(unittest.TestCase):
-    def test_help_lists_subcommands(self):
+    def test_help_lists_verbs_and_points_at_dev(self):
         r = run("--help")
         self.assertEqual(r.returncode, 0)
-        for sub in ("inspect", "rules", "baseline", "falco-rules"):
+        for word in ("weird PID | PATH", "weird trust", "weird untrust", "weird watch", "weird dev"):
+            self.assertIn(word, r.stdout)
+        r = run("dev", "--help")
+        self.assertEqual(r.returncode, 0)
+        for sub in ("inspect", "rules", "baseline", "falco-rules", "persist", "scan"):
             self.assertIn(sub, r.stdout)
 
     def test_falco_rules_is_yaml_rule_list(self):
-        r = run("falco-rules")
+        r = run("dev", "falco-rules")
         self.assertEqual(r.returncode, 0)
         rules = [l for l in r.stdout.splitlines() if l.startswith("- rule:")]
         self.assertGreater(len(rules), 3)
         self.assertIn("condition:", r.stdout)
 
     def test_json_scan_has_expected_shape(self):
-        r = run("--json")
+        r = run("dev", "scan", "--json")
         # 0 = clean, 1 = warnings, 2 = suspicious processes found; 3 = collector failure
         self.assertIn(r.returncode, (0, 1, 2), r.stderr[-500:])
         data = json.loads(r.stdout)

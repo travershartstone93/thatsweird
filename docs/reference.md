@@ -378,8 +378,7 @@ reads a half-written file.
 ## Scheduled scans
 
 The `systemd/` directory ships `weird.service` + `weird.timer` (daily scan
-with `--json --journal --prometheus`) and `weird-persist.service` +
-`weird-persist.timer` for the persistence check. They are user units, so
+with `--json --journal --prometheus`, every section in one run). They are user units, so
 the metrics file lives under `%h/.local/share/node_exporter/` (point
 node_exporter at that directory, or edit the path for the system instance
 as the comments explain). Install with either
@@ -443,4 +442,4 @@ deleted binaries, memfd execution) display "(Maybe Weird)".
 - `~/.config/weird/baseline.json`: Baseline data
 - `~/.config/weird/trusted.json`: Trusted executable hashes (`weird baseline trust`)
 - `package.json` (`weirdIntegrity`): sha256 pin of `bin/weird`, refreshed by `scripts/update-pin.py`
-- `systemd/weird.service`, `weird.timer`, `weird-persist.service`, `weird-persist.timer`: Scheduled scan units
+- `systemd/weird.service`, `weird.timer`: scheduled daily run

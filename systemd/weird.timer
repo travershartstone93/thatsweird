@@ -1,6 +1,6 @@
 # Daily trigger for weird.service. Persistent=true runs a missed scan at the next boot.
 [Unit]
-Description=Daily weird process anomaly scan
+Description=Daily weird anomaly report
 
 [Timer]
 OnCalendar=daily

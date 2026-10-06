@@ -85,7 +85,7 @@ class FixtureBox(unittest.TestCase):
         self.assertEqual(self.weird.sys_path("/etc/pacman.conf"), str(self.sysroot / "etc" / "pacman.conf"))
 
     def test_cli_reads_fixture_tree(self):
-        r = run_cli(["--json", "-v", "-a"], proc_root=self.proc, sysroot=self.sysroot, home=self.home)
+        r = run_cli(["dev", "scan", "--json", "-v", "-a"], proc_root=self.proc, sysroot=self.sysroot, home=self.home)
         self.assertIn(r.returncode, (0, 1, 2), r.stderr[-500:])
         data = json.loads(r.stdout)
         self.assertEqual({p["pid"] for p in data["processes"]}, {100, 200, 300})

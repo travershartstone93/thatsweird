@@ -69,7 +69,7 @@ class SandboxCopy(unittest.TestCase):
         pin = self.read_pin()
         self.assertEqual(pin["sha256"], sha256(self.repo / "bin" / "weird"))
         self.assertEqual(pin["version"], json.loads(self.package_json.read_text())["version"])
-        r = self.run_weird("self-check")
+        r = self.run_weird("dev", "self-check")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("self integrity: match", r.stdout)
         self.assertIn(f"sha256           {pin['sha256']}", r.stdout)
@@ -82,7 +82,7 @@ class SandboxCopy(unittest.TestCase):
         self.pin()
         real = self.read_pin()["sha256"]
         self.write_pin({"sha256": "0" * 64, "version": "0.0.1"})
-        r = self.run_weird("self-check")
+        r = self.run_weird("dev", "self-check")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("WARNING (self-integrity)", r.stderr)
         self.assertIn(RED, r.stderr)
@@ -91,7 +91,7 @@ class SandboxCopy(unittest.TestCase):
         self.assertIn("pinned sha256    " + "0" * 64, r.stdout)
         self.assertIn("pinned version   0.0.1", r.stdout)
         # the banner comes before any other output and never changes the exit code of a run
-        r = self.run_weird("--proc-root", str(self.proc), "--sysroot", str(self.sysroot), "kernel", "--json")
+        r = self.run_weird("--proc-root", str(self.proc), "--sysroot", str(self.sysroot), "dev", "kernel", "--json")
         self.assertIn(r.returncode, (0, 1, 2), r.stderr)
         self.assertTrue(r.stderr.startswith(RED + "WARNING (self-integrity)"), r.stderr[:200])
         self.assertEqual(json.loads(r.stdout)["self_integrity"], "mismatch")
@@ -101,13 +101,13 @@ class SandboxCopy(unittest.TestCase):
 
     def test_missing_pin_is_evidence_not_warning(self):
         self.write_pin(None)
-        r = self.run_weird("self-check")
+        r = self.run_weird("dev", "self-check")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("self integrity: unpinned", r.stdout)
         self.assertIn("integrity pin not found", r.stdout)
         self.assertIn("pinned sha256    none", r.stdout)
         self.assertEqual(r.stderr, "")
-        r = self.run_weird("self-check", "--json")
+        r = self.run_weird("dev", "self-check", "--json")
         payload = json.loads(r.stdout)
         self.assertEqual(payload["self_integrity"]["status"], "unpinned")
         self.assertIn("integrity pin not found", payload["self_integrity"]["detail"])
@@ -125,7 +125,7 @@ class SandboxCopy(unittest.TestCase):
         self.assertEqual(after["version"], json.loads(self.package_json.read_text())["version"])
         data = json.loads(self.package_json.read_text())
         self.assertEqual(data["name"], "thatsweird")
-        r = self.run_weird("self-check")
+        r = self.run_weird("dev", "self-check")
         self.assertIn("self integrity: match", r.stdout)
 
 

@@ -245,7 +245,7 @@ class InstallAndLookup(AurBox):
         self.assertEqual((hit[0]["severity"], hit[0]["detail"]), ("info", "runs install script as root (foo.install)"))
         out, _ = self.aur()
         self.assertNotIn("install script", out)
-        self.assertIn("(--all lists the info entries)", out)
+        self.assertIn("(-v lists the info entries)", out)
         out, _ = self.aur(all=True)
         self.assertIn("runs install script as root", out)
 
