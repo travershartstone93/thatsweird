@@ -13,6 +13,9 @@
 # Alerts and findings go to the journal as SYSLOG_IDENTIFIER=weird (journalctl -t weird);
 # the JSON report on stdout is logged under weird-scan so it does not mix in.
 # Add --skip hidden to leave out the slow pid probe.
+# The run compares with ~/.config/weird/baseline.json and logs the changes to the
+# journal (WEIRD_COMMAND=changes). It never saves a baseline: a timer that accepted
+# every state would defeat the comparison. Accept one by hand with `weird --save-baseline`.
 
 [Unit]
 Description=weird anomaly report (processes, persistence, kernel, AUR, hidden)

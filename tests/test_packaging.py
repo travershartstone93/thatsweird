@@ -162,7 +162,7 @@ class Documents(unittest.TestCase):
         for name in self.commands:
             self.assertIn(name.split()[0], r.stdout, name)
         for leaf in ("rules", "cache", "baseline", "fixture", "self-check", "falco-rules", "completions"):
-            self.assertNotIn(leaf, r.stdout)
+            self.assertNotRegex(r.stdout, rf"(?m)^\s+{leaf}(?![-\w])")
         r = run_cli(["dev", "--help"])
         self.assertEqual(r.returncode, 0)
         for name in self.commands:

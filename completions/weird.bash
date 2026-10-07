@@ -40,7 +40,7 @@ _weird() {
         "untrust "*) words="-h --help" ;;
         "watch "*) words="-h --help --poll --events --follow --no-follow --falco --journal" ;;
         "dev "*) words="-h --help scan inspect trust rules cache watch restart-needed persist hidden kernel aur self-check offline fixture falco-rules man completions baseline" ;;
-        " ") words="-h --help --version -v --verbose --json --ndjson --journal --prometheus --deep --offline --skip --no-prompt --proc-root --sysroot trust untrust watch dev" ;;
+        " ") words="-h --help --version -v --verbose --json --ndjson --journal --prometheus --deep --offline --skip --no-prompt --save-baseline --no-baseline --proc-root --sysroot trust untrust watch dev" ;;
     esac
     mapfile -t COMPREPLY < <(compgen -W "$words" -- "$cur")
 }

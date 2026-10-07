@@ -39,12 +39,11 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from datetime import datetime
 import time
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 
 # =============================================================================
@@ -6197,13 +6196,59 @@ def get_machine_id() -> str:
     return ""
 
 
-def snapshot_process(proc: ProcessInfo) -> Dict[str, str]:
+BASELINE_VERSION = 2
+BASELINE_PARTS = ("processes", "persistence", "packages", "posture")
+# kernel posture rows the baseline keeps, with the labels the kernel section prints
+POSTURE_LABELS = {
+    "secure_boot": "secure boot", "lockdown": "lockdown", "module_loading": "kernel module loading",
+    "modules_disabled": "modules_disabled", "sig_enforce": "sig_enforce", "kptr_restrict": "kptr_restrict",
+    "unprivileged_bpf_disabled": "unprivileged_bpf_disabled", "ptrace_scope": "yama ptrace_scope",
+    "core_pattern": "core dumps", "modprobe": "modprobe helper", "cmdline": "kernel cmdline", "lkrg": "LKRG",
+}
+
+
+def file_stamp(host_path: str) -> Tuple[int, int]:
+    """(size, mtime in ns) of a file, (0, 0) when it cannot be read."""
+    try:
+        st = os.stat(host_path)
+    except OSError:
+        return 0, 0
+    return st.st_size, st.st_mtime_ns
+
+
+def hash_once(hashes: Dict[str, str], path: str) -> str:
+    """sha256 through a per-run cache keyed by path (hash_file maps the path under the sysroot)."""
+    if path not in hashes:
+        hashes[path] = hash_file(path)
+    return hashes[path]
+
+
+def changed_hash(host_path: str, old: Dict, prefix: str, deep: bool = False) -> str:
+    """The file's sha256 when it differs from the hash a baseline entry recorded, else "".
+
+    The file is read again only when its size or mtime moved since the entry was
+    written (or under --deep), which keeps a run with a baseline fast.
+    """
+    old_hash = old.get(prefix + "sha256") or ""
+    if not old_hash:
+        return ""
+    size, mtime = file_stamp(host_path)
+    if not deep and (str(size), str(mtime)) == (str(old.get(prefix + "size")), str(old.get(prefix + "mtime_ns"))):
+        return ""
+    new_hash = digest_file(host_path, "sha256") or ""
+    return new_hash if new_hash and new_hash != old_hash else ""
+
+
+def snapshot_process(proc: ProcessInfo, hashes: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Create a baseline snapshot entry for a process."""
     exe_realpath = os.path.realpath(proc.path) if proc.path else ""
+    size, mtime = file_stamp(sys_path(exe_realpath)) if exe_realpath else (0, 0)
     return {
         "process_key": proc.process_key or build_process_key(proc),
         "exe_realpath": exe_realpath,
-        "exe_sha256": hash_file(exe_realpath),
+        "exe_sha256": hash_once(hashes, exe_realpath) if hashes is not None else hash_file(exe_realpath),
+        "exe_size": str(size),
+        "exe_mtime_ns": str(mtime),
         "uid": str(proc.uid),
         "cmdline": sanitize_cmdline(normalize_cmdline(proc.cmdline)),
         "package": proc.package or "",
@@ -6215,25 +6260,66 @@ def snapshot_process(proc: ProcessInfo) -> Dict[str, str]:
     }
 
 
-def write_baseline(processes: List[ProcessInfo]) -> None:
-    """Write baseline to disk."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    data = {
-        "machine_id": get_machine_id(),
-        "timestamp": int(time.time()),
-        "processes": [snapshot_process(p) for p in processes],
+def snapshot_persist_entry(entry: "PersistEntry") -> Dict[str, str]:
+    """A baseline entry for one persistence entry: where it is, what it runs and that file's hash."""
+    host = persist_host_path(entry.target) if entry.target else ""
+    size, mtime = file_stamp(host) if host else (0, 0)
+    return {
+        "source": entry.source, "file": entry.file, "key": entry.key, "target": entry.target,
+        "severity": entry.severity,
+        "target_sha256": (digest_file(host, "sha256") or "") if host else "",
+        "target_size": str(size), "target_mtime_ns": str(mtime),
     }
-    BASELINE_FILE.write_text(json.dumps(data, indent=2))
+
+
+def build_baseline(raw: Dict, previous: Optional[Dict] = None) -> Dict:
+    """The version 2 baseline: processes, persistence entries, foreign packages and kernel posture.
+
+    `raw` holds the section data of this run; a part that did not run (a skipped
+    section) is carried over from the previous baseline when it has one.
+    """
+    hashes: Dict[str, str] = {}
+    builders = {
+        "processes": lambda procs: [snapshot_process(p, hashes) for p in procs],
+        "persistence": lambda entries: [snapshot_persist_entry(e) for e in entries],
+        "packages": lambda pkgs: {p.name: p.version for p in pkgs},
+        "posture": lambda rows: {k: str(v) for k, v in rows.items() if k in POSTURE_LABELS},
+    }
+    data: Dict = {"version": BASELINE_VERSION, "machine_id": get_machine_id(), "timestamp": int(time.time())}
+    for part in BASELINE_PARTS:
+        if part in raw:
+            data[part] = builders[part](raw[part])
+        elif previous and part in previous:
+            data[part] = previous[part]
+    return data
+
+
+def save_baseline(data: Dict) -> None:
+    write_private_json(BASELINE_FILE, data)
+
+
+def write_baseline(processes: List[ProcessInfo]) -> None:
+    """weird dev baseline init: the process part, the rest carried over from an earlier baseline."""
+    save_baseline(build_baseline({"processes": processes}, load_baseline()))
 
 
 def load_baseline() -> Optional[Dict]:
-    """Load baseline from disk."""
+    """The saved baseline (version 1 held processes only; version 2 adds the other parts), or None."""
     if not BASELINE_FILE.exists():
         return None
+    if not private_file_ok(BASELINE_FILE):
+        print(f"Warning: ignoring {BASELINE_FILE}: it must be owned by you and not world-writable",
+              file=sys.stderr)
+        return None
     try:
-        return json.loads(BASELINE_FILE.read_text())
+        data = json.loads(BASELINE_FILE.read_text())
     except (OSError, json.JSONDecodeError):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def baseline_date(baseline: Dict) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(baseline.get("timestamp") or 0)))
 
 
 def diff_baseline(current: List[ProcessInfo], baseline: Dict,
@@ -6627,6 +6713,7 @@ def run_scan(args) -> Tuple[List[ProcessInfo], List[Dict], int]:
     debug_log("scan", f"processes_collected count={len(processes)}")
 
     classify_and_score(processes, user_trusted, deep=bool(getattr(args, "deep", False)))
+    note_snapshot("processes", list(processes))
 
     # Filter based on args
     if not args.all:
@@ -8412,6 +8499,7 @@ def cmd_persist(args) -> int:
     entries = collect_persistence()
     counts = persist_counts(entries)
     note_counts(counts)
+    note_snapshot("persistence", entries)
     code = persist_exit_code(entries)
     emit_findings_outputs(args, "persist", persist_findings(entries), started)
     if args.json:
@@ -8482,6 +8570,13 @@ _section_state = threading.local()
 def note_counts(counts: Dict[str, int]) -> None:
     """Severity counts of the section that just ran, read by the combined report (per thread)."""
     _section_state.counts = dict(counts)
+
+
+def note_snapshot(part: str, data) -> None:
+    """Raw section data the combined report keeps for the baseline (per thread)."""
+    if getattr(_section_state, "snapshot", None) is None:
+        _section_state.snapshot = {}
+    _section_state.snapshot[part] = data
 
 
 def plural(count: int, word: str, words: str = "") -> str:
@@ -9565,6 +9660,7 @@ def cmd_kernel(args) -> int:
     findings += ebpf_findings()
     sort_findings(findings)
     note_counts(finding_counts(findings))
+    note_snapshot("posture", posture)
     code = findings_exit_code(findings)
     summary["taint"] = taint
     summary["taint_flags"] = [text for _, text in decode_taint(taint or 0)]
@@ -10411,14 +10507,22 @@ def fetch_campaigns(url: str = CAMPAIGNS_URL, dest: Path = CAMPAIGNS_DIR, downlo
     return dest / "campaigns.json"
 
 
+def prompt_allowed(args) -> bool:
+    """The one rule for every question weird asks: a terminal on stdin and stdout, human
+    output (not --json/--ndjson), not watch mode, and neither --no-prompt nor WEIRD_NO_PROMPT."""
+    return (sys.stdin.isatty() and sys.stdout.isatty() and not getattr(args, "json", False)
+            and not getattr(args, "ndjson", False) and not getattr(args, "watch", False)
+            and getattr(args, "command", None) != "watch" and not getattr(args, "no_prompt", False)
+            and not os.environ.get("WEIRD_NO_PROMPT"))
+
+
 def maybe_offer_campaign_update(args, ask=None, fetch=None) -> Optional[Path]:
     """Which campaigns file the aur scan should use, after the one place a fetch may be offered.
 
     --campaigns PATH: that file, no prompt, no fetch. --fetch-campaigns: fetch now
-    without asking. Otherwise a [y/N] question is asked only on a terminal (stdin
-    and stdout), never under --json/--ndjson, in watch mode, with --no-prompt or
-    with WEIRD_NO_PROMPT set; Enter or EOF means no. A failed fetch prints one
-    line and the scan continues with whatever is cached.
+    without asking. Otherwise a [y/N] question is asked only when prompt_allowed
+    says so; Enter or EOF means no. A failed fetch prints one line and the scan
+    continues with whatever is cached.
     """
     ask = ask or input
     fetch = fetch or fetch_campaigns
@@ -10431,11 +10535,7 @@ def maybe_offer_campaign_update(args, ask=None, fetch=None) -> Optional[Path]:
     age_days = int((time.time() - fetched_at) // 86400) if fetched_at else None
     want = bool(getattr(args, "fetch_campaigns", False))
     if not want:
-        interactive = (sys.stdin.isatty() and sys.stdout.isatty() and not getattr(args, "json", False)
-                       and not getattr(args, "ndjson", False) and not getattr(args, "watch", False)
-                       and getattr(args, "command", None) != "watch" and not getattr(args, "no_prompt", False)
-                       and not os.environ.get("WEIRD_NO_PROMPT"))
-        if not interactive:
+        if getattr(args, "campaigns_asked", False) or not prompt_allowed(args):
             return cached
         if cached is None:
             question = ("Known-bad AUR package list: not downloaded. Fetch it from "
@@ -10485,6 +10585,7 @@ def cmd_aur(args) -> int:
     findings = [f for pkg in packages for f in pkg.findings] + extra
     sort_findings(findings)
     note_counts(finding_counts(findings))
+    note_snapshot("packages", packages)
     code = findings_exit_code(findings)
     emit_findings_outputs(args, "aur", findings, started)
 
@@ -11397,7 +11498,11 @@ def build_parser(with_verbs: bool = False) -> argparse.ArgumentParser:
                         help="Live-media mode: check a mounted disk (no process or hidden sections)")
     parser.add_argument("--skip", action="append", default=[], choices=SECTIONS, metavar="SECTION",
                         help="Leave out a section (repeatable): " + ", ".join(SECTIONS))
-    parser.add_argument("--no-prompt", dest="no_prompt", action="store_true", help="Never ask questions (the known-bad list fetch)")
+    parser.add_argument("--no-prompt", dest="no_prompt", action="store_true", help="Never ask questions (list fetch, baseline save)")
+    parser.add_argument("--save-baseline", dest="save_baseline", action="store_true",
+                        help="Record this run as the baseline, without asking")
+    parser.add_argument("--no-baseline", dest="no_baseline", action="store_true",
+                        help="Skip the comparison with the saved baseline")
     parser.add_argument("--proc-root", dest="proc_root", metavar="DIR", default=os.environ.get("WEIRD_PROC_ROOT"),
                         help="Read process info from DIR instead of /proc (replays, tests)")
     parser.add_argument("--sysroot", dest="sysroot", metavar="DIR", default=os.environ.get("WEIRD_SYSROOT"),
@@ -11473,14 +11578,15 @@ class SectionStdout:
         return getattr(self.real, name)
 
 
-def run_section(fn, args, out: SectionStdout, threaded: bool = False) -> Tuple[Dict, str, int, Dict[str, int]]:
-    """Run one section command, capturing its JSON payload or its table text and its counts.
+def run_section(fn, args, out: SectionStdout, threaded: bool = False) -> Tuple[Dict, str, int, Dict[str, int], Dict]:
+    """Run one section command, capturing its JSON payload or its table text, its counts and its raw data.
 
     A threaded section holds the root gate so the process scan cannot swap the module
     root (sysroot_override, for container processes) under it.
     """
     buf = io.StringIO()
     _section_state.counts = {}
+    _section_state.snapshot = {}
     out.capture(buf)
     try:
         with _root_gate.reading() if threaded else contextlib.nullcontext():
@@ -11488,9 +11594,10 @@ def run_section(fn, args, out: SectionStdout, threaded: bool = False) -> Tuple[D
     finally:
         out.release()
     text = buf.getvalue()
+    snapshot = getattr(_section_state, "snapshot", {}) or {}
     if args.json:
-        return json.loads(text), "", code, section_counts()
-    return {}, text, code, section_counts()
+        return json.loads(text), "", code, section_counts(), snapshot
+    return {}, text, code, section_counts(), snapshot
 
 
 def section_counts() -> Dict[str, int]:
@@ -11498,25 +11605,264 @@ def section_counts() -> Dict[str, int]:
     return {level: counts.get(level, 0) for level in ("critical", "medium", "low", "info", "yours")}
 
 
+class SectionThread(threading.Thread):
+    """Runs one section in the background. A daemon thread, so a Ctrl-C never waits for it."""
+
+    def __init__(self, fn, *args):
+        super().__init__(daemon=True)
+        self.fn, self.args = fn, args
+        self.result = None
+        self.error: Optional[BaseException] = None
+        self.start()
+
+    def run(self) -> None:
+        try:
+            self.result = self.fn(*self.args)
+        except BaseException as exc:
+            self.error = exc
+
+    def wait(self):
+        self.join()
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class Progress:
+    """One line on stderr naming the sections still running, redrawn every second.
+
+    Only when stderr is a terminal and the output is for a person; cleared before
+    any report text is printed and again when the run ends.
+    """
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.running: List[str] = []
+        self.lock = threading.Lock()
+        self.started = time.monotonic()
+        self.width = 0
+        self.stopped = threading.Event()
+        if enabled:
+            threading.Thread(target=self.tick, daemon=True).start()
+
+    def tick(self) -> None:
+        while not self.stopped.wait(1.0):
+            with self.lock:
+                self.draw()
+
+    def clear(self) -> None:
+        if self.width:
+            sys.stderr.write("\r" + " " * self.width + "\r")
+            sys.stderr.flush()
+            self.width = 0
+
+    def draw(self) -> None:
+        if not self.enabled:
+            return
+        if not self.running or self.stopped.is_set():
+            self.clear()
+            return
+        line = f"checking {', '.join(self.running)}... {int(time.monotonic() - self.started)}s"
+        sys.stderr.write("\r" + line.ljust(self.width))
+        sys.stderr.flush()
+        self.width = len(line)
+
+    def begin(self, name: str) -> None:
+        with self.lock:
+            self.running.append(name)
+            self.draw()
+
+    def end(self, name: str) -> None:
+        with self.lock:
+            if name in self.running:
+                self.running.remove(name)
+            self.draw()
+
+    def emit(self, text: str, out) -> None:
+        """Print report text with the progress line out of the way, then put it back."""
+        with self.lock:
+            self.clear()
+            out.write(text)
+            out.flush()
+            self.draw()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        with self.lock:
+            self.clear()
+
+
+# =============================================================================
+# Changes since the baseline
+# =============================================================================
+
 THREADED_SECTIONS = ("aur", "persist", "kernel")
+BASELINE_SECTIONS = ("processes", "aur", "persist", "kernel")
+PROGRESS_NAMES = {"processes": "processes", "aur": "AUR packages", "persist": "persistence", "kernel": "kernel",
+                  "stale": "stale binaries", "hidden": "hidden processes"}
+# a program not running when the baseline was saved: by where it came from
+NEW_PROCESS_SEVERITY = {"OFFICIAL": "info", "THIRD_PARTY": "info", "KERNEL": "info", "USER_TRUSTED": "info",
+                        "LOCAL_BUILD": "low", "USER_PKG": "low", "FLATPAK": "low", "SNAP": "low", "APPIMAGE": "low"}
+CHANGES_EXPLANATIONS = {
+    "new process": "A program that was not running when the baseline was saved. Expected after installing "
+                   "or starting something new; weird --save-baseline accepts it.",
+    "process hash changed": "The executable on disk is not the file the baseline recorded: an upgrade, or a "
+                            "replaced binary. The process section says whether its package still owns it.",
+    "new persistence entry": "Something new will start on its own. If you added it, weird --save-baseline "
+                             "records it.",
+    "persistence target changed": "The file a persistence entry launches has changed since the baseline.",
+    "new foreign package": "A package from outside the repositories installed since the baseline; the AUR "
+                           "section checked its PKGBUILD.",
+    "posture changed": "A kernel hardening setting moved since the baseline.",
+}
 
 
-def run_all(args) -> Tuple[Dict, Dict, int]:
-    """Every section, printed in a fixed order; returns ({section: payload or text}, summary, exit code).
+def process_changes(base_entries: List[Dict], processes: List[ProcessInfo], deep: bool) -> List[Finding]:
+    """Programs not in the baseline (same executable path run by the same user) and executables whose hash moved."""
+    base: Dict[Tuple[str, str], Dict] = {}
+    for entry in base_entries:
+        if entry.get("exe_realpath"):
+            base.setdefault((entry["exe_realpath"], str(entry.get("uid", ""))), entry)
+    findings: List[Finding] = []
+    seen: Set[Tuple[str, str]] = set()
+    for proc in processes:
+        realpath = os.path.realpath(proc.path) if proc.path else ""
+        key = (realpath, str(proc.uid))
+        if not realpath or key in seen:
+            continue
+        seen.add(key)
+        entry = base.get(key)
+        trust = proc.trust_level.value
+        if entry is None:
+            findings.append(Finding("new process", f"{proc.name} ({realpath}, {trust}) was not running when the "
+                                    "baseline was saved", NEW_PROCESS_SEVERITY.get(trust, "medium"), "", realpath))
+        elif changed_hash(sys_path(realpath), entry, "exe_", deep):
+            findings.append(Finding("process hash changed", f"{proc.name}: {realpath} is not the file the baseline "
+                                    "recorded", "medium", "T1554", realpath))
+    return findings
 
-    aur, persist and kernel run in threads while the process scan runs on the main
-    thread; stale and hidden follow on the main thread (the pid probe is CPU-bound).
+
+def persistence_changes(base_entries: List[Dict], entries: List["PersistEntry"], deep: bool) -> List[Finding]:
+    """Persistence entries added or removed (by file, key and target) and targets whose hash moved."""
+    base = {(e.get("file"), e.get("key"), e.get("target")): e for e in base_entries}
+    current = {(e.file, e.key, e.target): e for e in entries}
+    findings: List[Finding] = []
+    for key, entry in current.items():
+        old = base.get(key)
+        if old is None:
+            findings.append(Finding("new persistence entry", f"{entry.key} in {entry.file} runs "
+                                    f"{entry.target or entry.command} ({entry.provenance})", "medium",
+                                    entry.attack, entry.file))
+        elif entry.target and changed_hash(persist_host_path(entry.target), old, "target_", deep):
+            findings.append(Finding("persistence target changed", f"{entry.target}, run by {entry.key} in "
+                                    f"{entry.file}, is not the file the baseline recorded", "medium", "T1554",
+                                    entry.target))
+    for key, old in base.items():
+        if key not in current:
+            findings.append(Finding("persistence entry removed", f"{old.get('key')} in {old.get('file')} no longer "
+                                    f"runs {old.get('target') or '(none)'}", "info", "", str(old.get("file"))))
+    return findings
+
+
+def package_changes(base: Dict[str, str], packages: List["AurPackage"]) -> List[Finding]:
+    current = {p.name: p.version for p in packages}
+    findings: List[Finding] = []
+    for name, version in current.items():
+        if name not in base:
+            findings.append(Finding("new foreign package", f"{name} {version} was installed after the baseline",
+                                    "low", "", name))
+        elif base[name] != version:
+            findings.append(Finding("foreign package version", f"{name} went from {base[name]} to {version}",
+                                    "info", "", name))
+    for name, version in base.items():
+        if name not in current:
+            findings.append(Finding("foreign package removed", f"{name} {version} is no longer installed", "info",
+                                    "", name))
+    return findings
+
+
+def posture_changes(base: Dict[str, str], posture: Dict[str, str]) -> List[Finding]:
+    findings: List[Finding] = []
+    for key, label in POSTURE_LABELS.items():
+        old, new = base.get(key), str(posture.get(key, ""))
+        if old is not None and new and str(old) != new:
+            findings.append(Finding("posture changed", f"{label} went from {old} to {new}", "medium", "", label))
+    return findings
+
+
+def baseline_changes(baseline: Dict, raw: Dict, deep: bool = False) -> List[Finding]:
+    """What this run shows that the baseline did not; a part missing on either side is not compared."""
+    findings: List[Finding] = []
+    if "processes" in baseline and "processes" in raw:
+        findings += process_changes(baseline["processes"], raw["processes"], deep)
+    if "persistence" in baseline and "persistence" in raw:
+        findings += persistence_changes(baseline["persistence"], raw["persistence"], deep)
+    if "packages" in baseline and "packages" in raw:
+        findings += package_changes(baseline["packages"], raw["packages"])
+    if "posture" in baseline and "posture" in raw:
+        findings += posture_changes(baseline["posture"], raw["posture"])
+    sort_findings(findings)
+    return findings
+
+
+def compared_parts(baseline: Dict, raw: Dict) -> str:
+    parts = []
+    if "processes" in baseline and "processes" in raw:
+        parts.append(plural(len(raw["processes"]), "process", "processes"))
+    if "persistence" in baseline and "persistence" in raw:
+        parts.append(plural(len(raw["persistence"]), "persistence entry", "persistence entries"))
+    if "packages" in baseline and "packages" in raw:
+        parts.append(plural(len(raw["packages"]), "foreign package"))
+    if "posture" in baseline and "posture" in raw:
+        parts.append("kernel posture")
+    return ", ".join(parts) or "nothing to compare"
+
+
+def changes_text(changes: List[Finding], baseline: Dict, raw: Dict, verbose: bool) -> str:
+    """The changes section as the report prints it (header included)."""
+    date = baseline_date(baseline)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print(f"== Changes since {date} ==\n")
+        counts = finding_counts(changes)
+        shown = [f for f in changes if verbose or f.severity != "info"]
+        if not changes:
+            print(f"nothing changed ({compared_parts(baseline, raw)} compared)")
+        elif not shown:
+            print(f"nothing to look at: {plural(counts['info'], 'info change')} (-v lists them)")
+        else:
+            print_findings(shown, CHANGES_EXPLANATIONS)
+            tail = "" if verbose or not counts["info"] else " (-v lists the info changes)"
+            print(f"\n{plural(len(changes), 'change')}: {counts['critical']} critical, {counts['medium']} medium, "
+                  f"{counts['low']} low, {counts['info']} info{tail}")
+    return buf.getvalue()
+
+
+def changes_payload(changes: List[Finding], baseline: Dict) -> Dict:
+    return {"baseline_timestamp": int(baseline.get("timestamp") or 0), "baseline_date": baseline_date(baseline),
+            "findings": [asdict(f) for f in changes], "counts": finding_counts(changes)}
+
+
+def run_all(args) -> Tuple[Dict, Dict, int, Dict]:
+    """Every section in a fixed order; returns ({section: payload or text}, summary, exit code, state).
+
+    aur, persist and kernel run in daemon threads while the process scan runs on the
+    main thread; stale and hidden follow on the main thread (the pid probe is
+    CPU-bound). The sections the baseline covers are held until all of them are
+    done so the changes section can print first; the rest stream as they finish.
+    The state carries the raw section data (for the baseline), the baseline and
+    changes used, and the section a Ctrl-C landed in.
     """
     parser = build_dev_parser()
     sections: Dict[str, object] = {}
     summary = {"critical": 0, "medium": 0, "low": 0, "info": 0, "yours": 0}
+    state: Dict = {"raw": {}, "baseline": None, "changes": None, "interrupted": ""}
     exit_code = 0
     if "aur" not in getattr(args, "skip", None or []):
         chosen = maybe_offer_campaign_update(args)
         if chosen is not None:
             args.campaigns = str(chosen)
-        else:
-            args.no_prompt = True
+        args.campaigns_asked = True
     plan = [
         ("processes", cmd_scan, "Processes", {}),
         ("aur", cmd_aur, "AUR packages", {}),
@@ -11528,33 +11874,74 @@ def run_all(args) -> Tuple[Dict, Dict, int]:
     command = {"processes": "scan", "stale": "restart-needed"}
     plan = [(name, fn, title, extra if name == "processes" else dict(extra, prometheus=None))
             for name, fn, title, extra in plan if name not in args.skip]
+    baseline = None if getattr(args, "no_baseline", False) else load_baseline()
+    state["baseline"] = baseline
     # shared caches are filled once here, before any section runs in a thread
     file_package_cache.build()
     real = sys.stdout
     out = SectionStdout(real)
     sys.stdout = out
+    progress = Progress(not args.json and sys.stderr.isatty())
+    started = time.monotonic()
+    held: List[str] = []
+    printed = False
+    current = ""
+
+    def emit(block: str) -> None:
+        nonlocal printed
+        progress.emit(("\n" if printed else "") + block, real)
+        printed = True
+
     try:
-        with ThreadPoolExecutor(max_workers=len(THREADED_SECTIONS)) as pool:
-            futures = {name: pool.submit(run_section, fn, section_args(args, parser, command.get(name, name), **extra),
-                                         out, True) for name, fn, title, extra in plan if name in THREADED_SECTIONS}
-            for name, fn, title, extra in plan:
-                if name in futures:
-                    payload, text, code, counts = futures[name].result()
-                else:
-                    payload, text, code, counts = run_section(fn, section_args(args, parser, command.get(name, name), **extra), out)
-                for level in summary:
-                    summary[level] += counts[level]
-                exit_code = 3 if 3 in (exit_code, code) else max(exit_code, code)
-                if args.json:
-                    sections[name] = payload
-                elif name != "stale" or code:
-                    print(("" if not sections else "\n") + f"== {title} ==\n")
-                    print(text.rstrip("\n"))
-                    sections[name] = text
+        threads = {}
+        for name, fn, title, extra in plan:
+            if name in THREADED_SECTIONS:
+                progress.begin(PROGRESS_NAMES[name])
+                threads[name] = SectionThread(run_section, fn, section_args(args, parser, command.get(name, name), **extra),
+                                              out, True)
+        for index, (name, fn, title, extra) in enumerate(plan):
+            current = name
+            if name in threads:
+                payload, text, code, counts, raw = threads[name].wait()
+            else:
+                progress.begin(PROGRESS_NAMES[name])
+                payload, text, code, counts, raw = run_section(
+                    fn, section_args(args, parser, command.get(name, name), **extra), out)
+            progress.end(PROGRESS_NAMES[name])
+            state["raw"].update(raw)
+            for level in summary:
+                summary[level] += counts[level]
+            exit_code = 3 if 3 in (exit_code, code) else max(exit_code, code)
+            if args.json:
+                sections[name] = payload
+            elif name != "stale" or code:
+                held.append(f"== {title} ==\n\n{text.rstrip(chr(10))}\n")
+                sections[name] = text
+            if any(later in BASELINE_SECTIONS for later, *_ in plan[index + 1:]):
+                continue
+            if baseline is not None and state["changes"] is None:
+                changes = baseline_changes(baseline, state["raw"], getattr(args, "deep", False))
+                state["changes"] = changes
+                for f in changes:
+                    summary[f.severity] += 1
+                code = findings_exit_code(changes)
+                exit_code = exit_code if exit_code == 3 else max(exit_code, code)
+                emit_findings_outputs(args, "changes", changes, started)
+                if not args.json:
+                    held.insert(0, changes_text(changes, baseline, state["raw"], getattr(args, "verbose", False)))
+            for block in held:
+                emit(block)
+            held = []
+    except KeyboardInterrupt:
+        state["interrupted"] = current
+        exit_code = 130
+        for block in held:
+            emit(block)
     finally:
+        progress.stop()
         sys.stdout = real
     summary["exit_code"] = exit_code
-    return sections, summary, exit_code
+    return sections, summary, exit_code, state
 
 
 def summary_line(summary: Dict) -> str:
@@ -11563,6 +11950,38 @@ def summary_line(summary: Dict) -> str:
     return (f"summary: {look} to look at ({summary['critical']} critical, {summary['medium']} medium, "
             f"{summary['low']} low), {summary['yours']} {yours} your own unpackaged software, "
             f"{summary['info']} info (exit {summary['exit_code']})")
+
+
+def baseline_after_run(args, state: Dict) -> None:
+    """Save the baseline (--save-baseline, or the one question a first interactive run asks), or say how to.
+
+    A run without a terminal never writes one on its own. An existing baseline is
+    never updated in place: the user accepts the current state with --save-baseline.
+    """
+    if getattr(args, "no_baseline", False) or state["interrupted"] or not state["raw"]:
+        return
+    note = sys.stderr if args.json else sys.stdout
+    baseline = state["baseline"]
+    if getattr(args, "save_baseline", False):
+        save = True
+    elif baseline is None and prompt_allowed(args):
+        try:
+            answer = input("Save this run as the baseline so future runs show what changed? [Y/n] ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        save = answer.strip().lower() in ("", "y", "yes")
+    else:
+        if state["changes"] and not args.json:
+            print(f"baseline from {baseline_date(baseline)}; run `weird --save-baseline` to accept the current state")
+        return
+    if not save:
+        return
+    data = build_baseline(state["raw"], baseline)
+    save_baseline(data)
+    print(f"baseline saved to {BASELINE_FILE}: {plural(len(data.get('processes', [])), 'process', 'processes')}, "
+          f"{plural(len(data.get('persistence', [])), 'persistence entry', 'persistence entries')}, "
+          f"{plural(len(data.get('packages', {})), 'foreign package')}", file=note)
 
 
 def cmd_all(args) -> int:
@@ -11574,16 +11993,26 @@ def cmd_all(args) -> int:
     if args.ndjson:
         parser = build_dev_parser()
         return cmd_scan(section_args(args, parser, "scan"))
-    sections, summary, exit_code = run_all(args)
+    sections, summary, exit_code, state = run_all(args)
     if args.json:
         payload = {"host": socket.gethostname(), "timestamp": int(time.time()), "self_check": warnings,
                    "self_integrity": _self_integrity}
         payload.update(sections)
+        if state["changes"] is not None:
+            payload["changes"] = changes_payload(state["changes"], state["baseline"])
+        if state["interrupted"]:
+            payload["interrupted"] = state["interrupted"]
         payload["summary"] = summary
         print(json.dumps(payload, indent=2))
+        baseline_after_run(args, state)
         return exit_code
+    if state["interrupted"]:
+        print(f"\ninterrupted during {PROGRESS_NAMES.get(state['interrupted'], state['interrupted'])}")
+        print(f"\n{summary_line(summary)} (partial)")
+        return 130
     print()
     print(summary_line(summary))
+    baseline_after_run(args, state)
     return exit_code
 
 

@@ -136,9 +136,27 @@ suppressed and tagged "build"; a shell, interpreter, curl or wget whose ancestor
 PDF viewer, office suite or mail client gains 30 points (T1204.002). Print them with
 \fBweird rules show \-\-defaults\fR; \fBdefaults = false\fR in rules.toml disables them.
 .SH BASELINE / DIFF
-Baseline stores process_key, exe realpath, sha256 (if readable), uid, cmdline (sanitized),
-package, trust level, provenance, and evidence snippet. Diff reports new, changed_hash,
-moved, and trust_changed.
+On a terminal the first run asks once, after the report, whether to save it as
+the baseline (Enter means yes); the question follows the same rule as the
+known\-bad list question and a run without a terminal never writes one. From
+then on every run opens with a "Changes since DATE" section: programs not
+running when the baseline was saved (matched by executable path and user; medium
+when unpackaged or unknown, low for a locally built or language\-manager package,
+info when OFFICIAL), executables whose hash moved (medium, re\-read only when
+size or mtime changed, every file with \fB\-\-deep\fR), persistence entries
+added (medium) or removed (info) and targets whose hash moved (medium), foreign
+packages added (low), removed or rebuilt (info), and kernel posture rows that
+changed (medium). Medium and low rows count toward the summary and the exit
+status. The baseline is never updated by a run; \fB\-\-save\-baseline\fR
+accepts the current state and \fB\-\-no\-baseline\fR skips the comparison.
+.PP
+The file is version 2: processes (process_key, exe realpath, sha256, size,
+mtime, uid, sanitized cmdline, package, trust level, provenance, evidence),
+persistence entries (file, key, target, severity, target hash), foreign packages
+with versions and the posture rows. A version 1 file (processes only) is still
+read. \fBdev baseline init\fR writes the process part, \fBshow\fR prints the
+file and \fBdiff\fR is the older process\-only comparison (new, changed_hash,
+moved, trust_changed).
 .PP
 \fBbaseline trust\fR \fIPID_OR_PATH\fR records the executable's realpath, sha256,
 package and trust level in ~/.config/weird/trusted.json (0600, written atomically,
@@ -232,7 +250,7 @@ Write the rules template to disk. Use \fB\-\-force\fR to overwrite.
 Show cache status. Use \fB\-\-rebuild\fR to rebuild file\-\>package mapping.
 .TP
 .B baseline
-Baseline/diff mode. \fBinit\fR writes a baseline, \fBshow\fR prints it, \fBdiff\fR compares
+Baseline/diff mode. \fBinit\fR writes the process part of the baseline, \fBshow\fR prints it, \fBdiff\fR compares
 (and re\-hashes trusted files). \fBtrust\fR \fIPID_OR_PATH\fR records an executable hash
 in trusted.json so scans stay quiet until the file changes; \fBuntrust\fR \fIPATH\fR
 removes it. See BASELINE / DIFF.
@@ -497,8 +515,17 @@ Live\-media mode: persist, executable integrity and aur against a mounted disk,
 with no process or hidden sections. Refuses / without \fB\-\-force\fR.
 .TP
 .B \-\-no\-prompt
-Never ask a question. The only question weird asks is whether to download the
-known\-bad AUR list; this flag, or WEIRD_NO_PROMPT in the environment, answers no.
+Never ask a question. weird asks two: whether to download the known\-bad AUR
+list, and whether to save the first run as the baseline; this flag, or
+WEIRD_NO_PROMPT in the environment, answers no to both.
+.TP
+.B \-\-save\-baseline
+Record this run as the baseline (~/.config/weird/baseline.json) without asking,
+replacing the saved one: this is how a new state is accepted. The timer unit does
+not pass it, so changes are reported until you run it by hand.
+.TP
+.B \-\-no\-baseline
+Neither compare with the saved baseline nor ask to save one.
 .TP
 .B \-\-log\-file \fIFILE\fR
 Append logs to a file (no secrets).
@@ -625,6 +652,10 @@ At least one critical finding.
 .TP
 .B 3
 A collector failed or an internal error; the report may be partial.
+.TP
+.B 130
+Interrupted with Ctrl\-C: the sections that finished were printed, then
+"interrupted during SECTION" and a summary marked (partial).
 .SH SECURITY NOTES
 Trust indicates provenance only. Even OFFICIAL packages can be compromised.
 Use weird as part of defense\-in\-depth, not as your only security control.

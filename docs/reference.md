@@ -9,12 +9,16 @@ The sections below are the sections of one plain `weird` run; each is also a
 ## One run
 
 Plain `weird` prints, in order: the self-check lines (only when something is
-wrong), the process scan, AUR packages (foreign package list, known-bad
+wrong), the changes since the baseline (once one is saved, see "Baseline"
+below), the process scan, AUR packages (foreign package list, known-bad
 cross-check, PKGBUILD analysis), persistence entries, kernel posture and
 findings, stale binaries (only when a process still runs a replaced file) and
 the hidden-process cross-views (the pid probe, last). The AUR, persistence and
 kernel sections run in threads while the process scan runs, so the whole report
-takes a few seconds; the output order never changes. A section with nothing to
+takes a few seconds; the output order never changes. While a section runs and
+stderr is a terminal, one line on stderr names the sections still running
+("checking hidden processes... 3s"); it is cleared before the report prints and
+never written under `--json` or to a pipe. A section with nothing to
 show prints its header and one "nothing to report" line with its counts; the
 tables, the kernel posture rows, the info notes and the security banner appear
 with `-v` and in the single `weird dev` commands.
@@ -35,12 +39,21 @@ behind each finding. `--json` prints one object with a key per section plus
 `--deep` hashes every packaged executable (below) and makes the hidden section
 sweep every pid up to pid_max instead of stopping at the last pid assigned.
 `--journal` and `--prometheus PATH` apply to every section. `--offline SYSROOT`
-runs the live-media checks instead (below). `--no-prompt`, or WEIRD_NO_PROMPT in
-the environment, means weird never asks a question; the only question it has is
-whether to download the known-bad AUR list. `--proc-root DIR` and `--sysroot
-DIR` (or WEIRD_PROC_ROOT and WEIRD_SYSROOT) point every section at a recorded
-tree. `weird PID` and `weird PATH` inspect one process or file, `weird trust`
-and `weird untrust` manage the baseline, `weird watch` streams.
+runs the live-media checks instead (below). `--save-baseline` records this run
+as the baseline without asking; `--no-baseline` skips the comparison and the
+question. `--no-prompt`, or WEIRD_NO_PROMPT in the environment, means weird
+never asks a question; its two questions are whether to download the known-bad
+AUR list and whether to save the first run as the baseline. `--proc-root DIR`
+and `--sysroot DIR` (or WEIRD_PROC_ROOT and WEIRD_SYSROOT) point every section
+at a recorded tree. `weird PID` and `weird PATH` inspect one process or file,
+`weird trust` and `weird untrust` manage the trusted hashes, `weird watch`
+streams.
+
+Ctrl-C during a run prints the sections that had finished, one line
+"interrupted during <section>", the summary line marked "(partial)", and exits
+130. Under `--json` the document is still valid JSON with an "interrupted" key
+naming the section and only the finished sections present. The sections that
+run in threads are daemon threads, so an interrupted run never waits for them.
 
 ### The dev commands
 
@@ -535,12 +548,75 @@ systemctl --user daemon-reload && systemctl --user enable --now weird.timer
 ```
 
 Exit codes 1 and 2 are listed as `SuccessExitStatus` so a scan that finds
-something does not show up as a failed unit. For a desktop notification
+something does not show up as a failed unit. The timer run compares with the
+saved baseline and logs the changes to the journal (`WEIRD_COMMAND=changes`)
+but never saves one, since a timer that accepted every state would defeat the
+comparison; accept a new state by running `weird --save-baseline` yourself. For a desktop notification
 after each run:
 
 ```bash
 weird --journal; notify-send weird "$(journalctl -t weird -p warning -n 1 -o cat)"
 ```
+
+## Baseline (what changed since last time)
+
+The first interactive run asks once, after the report, "Save this run as the
+baseline so future runs show what changed? [Y/n]"; Enter means yes. The
+question follows the same rule as the known-bad list question: stdin and
+stdout must be a terminal, and it is never asked under `--json`, `--ndjson`,
+`watch`, `--no-prompt` or WEIRD_NO_PROMPT. A run without a terminal never
+writes a baseline on its own. `weird --save-baseline` writes one without
+asking (also when one exists: that is how a new state is accepted);
+`--no-baseline` neither compares nor asks. The file is
+`~/.config/weird/baseline.json`, 0600, written atomically and ignored with a
+warning when world-writable or owned by someone else.
+
+Format, `"version": 2` (a version 1 file, processes only, is still read and
+its missing parts are simply not compared):
+
+- `processes`: one entry per process examined (the display filters do not
+  apply): `process_key`, `exe_realpath`, `exe_sha256`, `exe_size`,
+  `exe_mtime_ns`, `uid`, sanitized `cmdline`, `package`, `manager`,
+  `ownership`, `signature`, `trust_level`, an `evidence` snippet.
+- `persistence`: one entry per persistence entry: `source`, `file`, `key`,
+  `target`, `severity`, `target_sha256`, `target_size`, `target_mtime_ns`.
+- `packages`: the foreign (`pacman -Qm`) packages as name to version.
+- `posture`: the kernel posture rows (secure boot, lockdown, module loading,
+  modules_disabled, sig_enforce, kptr_restrict, unprivileged_bpf_disabled,
+  ptrace_scope, core dumps, modprobe helper, kernel cmdline, LKRG).
+- `machine_id`, `timestamp`.
+
+With a baseline present the report opens with `== Changes since <date> ==`,
+a KIND / DETAIL / SEVERITY table like the other sections (info rows with
+`-v`), or "nothing changed (N processes, M persistence entries, K foreign
+packages, kernel posture compared)". The rows:
+
+- `new process` (a program not running when the baseline was saved, matched
+  by executable path and user, so a second copy of a known program is not
+  new): medium for USER_LOCAL, UNKNOWN and container processes, low for a
+  LOCAL_BUILD, USER_PKG, Flatpak, Snap or AppImage program, info when
+  OFFICIAL, THIRD_PARTY, kernel or trusted.
+- `process hash changed` (medium, T1554): the executable on disk is not the
+  file the baseline recorded. A file is only re-read when its size or mtime
+  moved since the baseline (every file with `--deep`), so a run with a
+  baseline costs no more than one without.
+- `new persistence entry` (medium) and `persistence entry removed` (info),
+  matched by file, key and target; `persistence target changed` (medium,
+  T1554) when the launched file's hash moved.
+- `new foreign package` (low), `foreign package version` (info) and `foreign
+  package removed` (info).
+- `posture changed` (medium): a posture row has another value, for example
+  kernel module loading went from signed only to open.
+
+The medium and low rows count toward "to look at" in the summary and set the
+exit status like any other finding; info rows do not. The baseline is never
+updated by a run: after a run with changes the report ends with "baseline from
+<date>; run `weird --save-baseline` to accept the current state". `--json`
+carries the same rows under `"changes"` (`baseline_timestamp`,
+`baseline_date`, `findings`, `counts`); `--journal` logs them with
+`WEIRD_COMMAND=changes`. `weird dev baseline init|show|diff` still exist: init
+writes the process part (keeping the other parts of an existing file), diff is
+the older process-only comparison.
 
 ## Baseline trust (a file integrity monitor for what you run)
 
@@ -583,7 +659,7 @@ maps, or a JIT engine embedded in its executable).
 - `~/.config/weird/rules.toml`: User rules
 - `~/.config/weird/user_trusted.txt`: User trusted list
 - `~/.config/weird/cache/file_package_map.json`: File -> package cache
-- `~/.config/weird/baseline.json`: Baseline data
+- `~/.config/weird/baseline.json`: the baseline (version 2: processes, persistence entries, foreign packages, posture), 0600
 - `~/.config/weird/trusted.json`: Trusted executable hashes (`weird trust`)
 - `~/.config/weird/campaigns/`: known-bad AUR list (campaigns.json, the list files it names, meta.json), 0600
 - `package.json` (`weirdIntegrity`): sha256 pin of `bin/weird`, refreshed by `scripts/update-pin.py`

@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.4.0
+
+A baseline by default. On a terminal the first run asks once, after the
+report, whether to save it as the baseline (Enter means yes; the file is
+~/.config/weird/baseline.json, 0600, and nothing leaves the machine). Every
+later run opens with a "Changes since <date>" section: programs that were not
+running when the baseline was saved (matched by executable path and user;
+medium when unpackaged or unknown, low for a locally built or language-manager
+package, info when OFFICIAL), executables whose hash moved (re-read only when
+size or mtime changed, every file with `--deep`), persistence entries added
+(medium) or removed (info) and targets whose hash moved, foreign packages
+added (low), removed or rebuilt (info), and kernel posture rows that changed
+(medium). Medium and low rows count toward "to look at" and the exit status.
+The baseline is never updated on its own: `--save-baseline` records the
+current state without asking and `--no-baseline` skips the comparison. A run
+without a terminal, or under `--json`, `--ndjson`, `--no-prompt` or
+WEIRD_NO_PROMPT, never asks and never writes one; the shipped timer keeps
+comparing and logs the changes to the journal. The file is version 2
+(processes with size and mtime, persistence entries with target hashes,
+foreign packages with versions, posture rows); a version 1 file is still read.
+`--json` carries the rows under "changes". `weird dev baseline init` writes
+the process part only.
+
+A progress line on stderr ("checking hidden processes... 3s", naming every
+section still running) while the report is being built, only when stderr is a
+terminal and never under `--json`. Ctrl-C prints the sections that finished,
+"interrupted during <section>" and a summary marked "(partial)", and exits
+130; under `--json` the partial document is still valid JSON with an
+"interrupted" key. The section threads are daemon threads, so an interrupted
+run does not wait for them.
+
 ## 1.3.0
 
 Faster and quieter. The default hidden-process probe stops a margin above the
