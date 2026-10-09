@@ -21,9 +21,9 @@ class ContainerBox(ArchBox):
         self.add_pkg("bash", "5.3.15-2", "/usr/bin/bash", repo="core", packager=ARCH)
         make_proc(self.proc, 100, "/usr/bin/bash")
 
-    def container(self, pid, exe, marker=True, **kwargs):
-        """A docker process whose /proc/<pid>/root is a directory holding the image."""
-        make_proc(self.proc, pid, exe, cgroup=DOCKER_CGROUP, **kwargs)
+    def container(self, pid, exe, marker=True, cgroup=DOCKER_CGROUP, **kwargs):
+        """A container process whose /proc/<pid>/root is a directory holding the image."""
+        make_proc(self.proc, pid, exe, cgroup=cgroup, **kwargs)
         root = self.proc / str(pid) / "root"
         root.mkdir(parents=True, exist_ok=True)
         if marker:
@@ -209,3 +209,48 @@ class HostAfterContainer(ContainerBox):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+PODMAN_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/db.service/libpod-payload-c4a47815ff5e86d02b552adb5760b64a5c7d07b47221cc2e146d1b06523e4214"
+CID = "c4a47815ff5e86d02b552adb5760b64a5c7d07b47221cc2e146d1b06523e4214"
+
+
+class ImageLayerAttribution(ContainerBox):
+    """An unowned container binary is judged by whether the image build or the running container put it there."""
+
+    def podman(self, image_diff, container_diff):
+        self.table[("podman", "inspect", "--format", "{{.Image}}", CID)] = "a221f3391b5e\n"
+        self.table[("podman", "image", "diff", "a221f3391b5e")] = image_diff
+        self.table[("podman", "diff", CID)] = container_diff
+
+    def chroma(self, which):
+        root = self.container(700, "/usr/local/bin/chroma", comm="chroma", cgroup=PODMAN_CGROUP)
+        make_apt_pkg(root, "dumb-init", ["/usr/bin/dumb-init"])
+        make_stub_file(root, "/usr/local/bin/chroma")
+        with mock.patch.object(self.weird.shutil, "which", which):
+            procs, code = self.scan()
+        return procs[700], code
+
+    def test_binary_placed_by_image_build_is_container(self):
+        self.podman("A /usr/local/bin/chroma\nA /config.yaml\n", "A /data\nC /etc\n")
+        proc, code = self.chroma(lambda name: "/usr/bin/podman" if name == "podman" else None)
+        self.assertEqual(proc.trust_level, self.weird.TrustLevel.CONTAINER)
+        self.assertFalse(proc.container_unowned)
+        self.assertNotIn("container_unowned", proc.signal_keys)
+        self.assertTrue(any("put there by the image build" in e for e in proc.evidence), proc.evidence)
+        self.assertEqual(code, 0)
+
+    def test_binary_added_at_runtime_stays_unowned(self):
+        self.podman("A /config.yaml\n", "A /usr/local/bin/chroma\nA /data\n")
+        proc, code = self.chroma(lambda name: "/usr/bin/podman" if name == "podman" else None)
+        self.assertTrue(proc.container_unowned)
+        self.assertIn("container_unowned", proc.signal_keys)
+        self.assertTrue(any("added after the container started" in e for e in proc.evidence), proc.evidence)
+        self.assertEqual(code, 1)
+
+    def test_no_runtime_tool_keeps_old_verdict(self):
+        proc, code = self.chroma(lambda name: None)
+        self.assertTrue(proc.container_unowned)
+        self.assertTrue(any("no package in the image owns it" in e for e in proc.evidence), proc.evidence)
+        self.assertEqual(code, 1)

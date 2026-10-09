@@ -2,6 +2,13 @@
 
 ## 1.4.0
 
+Later in 1.4.0: the known-bad list is fetched once, up front, and tries every
+address DNS returns so a dead IPv6 route falls through to IPv4; `--fetch-campaigns`
+and `--campaigns` work on the main command. A container binary that no package
+owns is now attributed through the image's own layers (podman or docker image
+diff), so a program compiled and copied in by the image build counts as part of
+the image and only a file added after the container started is scored.
+
 A baseline by default. On a terminal the first run asks once, after the
 report, whether to save it as the baseline (Enter means yes; the file is
 ~/.config/weird/baseline.json, 0600, and nothing leaves the machine). Every

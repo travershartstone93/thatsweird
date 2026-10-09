@@ -413,7 +413,15 @@ is recognised from the metadata those tools leave behind (every file in a
 `*.dist-info/RECORD` under the image's site-packages, console scripts under
 /usr/local/bin included when their shebang points at a python in the image,
 and every file under /usr/local/lib/node_modules) and stays CONTAINER with
-evidence `installed in image by pip (NAME VERSION)`. An unreadable root leaves the
+evidence `installed in image by pip (NAME VERSION)`. A binary no package or
+language manager owns is then checked against the image itself: when podman or
+docker is available, `image diff` says whether one of the image's own layers
+put the file there (a multi-stage build that compiles a program and copies it
+in, as the official chromadb image does) and `diff CONTAINER` says whether it
+appeared after the container started. Placed by the image build: CONTAINER, no
+score, evidence `put there by the image build`. Added at runtime: still
+`container_unowned`, evidence `added after the container started`. No runtime
+tool: the old verdict. An unreadable root leaves the
 process at CONTAINER with "container provenance unavailable" and no score.
 Host processes are unaffected: the sysroot and caches are restored after
 each container lookup.

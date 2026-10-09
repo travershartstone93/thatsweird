@@ -4277,6 +4277,74 @@ def image_language_owner(root: str, path: str) -> Optional[Tuple[str, str]]:
     return hit
 
 
+_image_layer_cache: Dict[str, Optional[set]] = {}
+_runtime_added_cache: Dict[str, Optional[set]] = {}
+
+
+def container_id_for(pid: int) -> Optional[str]:
+    """Container id from the pid's cgroup path (podman libpod-<id>, docker/<id>, containerd)."""
+    try:
+        with open(proc_path(pid, "cgroup")) as f:
+            cgroup = f.read()
+    except OSError:
+        return None
+    m = re.search(r"(?:libpod-(?:payload-)?|docker-|docker/|containerd-|cri-containerd-)([0-9a-f]{12,64})", cgroup)
+    return m.group(1) if m else None
+
+
+def container_runtime_tool(container_id: str) -> Optional[str]:
+    for tool in ("podman", "docker"):
+        if shutil.which(tool) and run_command([tool, "inspect", "--format", "{{.Image}}", container_id], timeout=10):
+            return tool
+    return None
+
+
+def image_layer_files(tool: str, container_id: str) -> Optional[set]:
+    """Paths added or changed by the image's own layers (what the image build put there)."""
+    image = (run_command([tool, "inspect", "--format", "{{.Image}}", container_id], timeout=10) or "").strip()
+    if not image:
+        return None
+    if image in _image_layer_cache:
+        return _image_layer_cache[image]
+    out = run_command([tool, "image", "diff", image], timeout=30)
+    if out is None:
+        _image_layer_cache[image] = None
+        return None
+    files = {line.split(" ", 1)[1].strip() for line in out.splitlines() if line[:2] in ("A ", "C ")}
+    _image_layer_cache[image] = files
+    return files
+
+
+def runtime_added_files(tool: str, container_id: str) -> Optional[set]:
+    """Paths added or changed inside the running container since it started from its image."""
+    if container_id in _runtime_added_cache:
+        return _runtime_added_cache[container_id]
+    out = run_command([tool, "diff", container_id], timeout=30)
+    files = None if out is None else {line.split(" ", 1)[1].strip() for line in out.splitlines()
+                                      if line[:2] in ("A ", "C ")}
+    _runtime_added_cache[container_id] = files
+    return files
+
+
+def image_build_placed(pid: int, path: str) -> Optional[bool]:
+    """True when the image's layers put path there, False when it was added at runtime, None when unknown."""
+    container_id = container_id_for(pid)
+    if not container_id:
+        return None
+    tool = container_runtime_tool(container_id)
+    if not tool:
+        return None
+    layer_files = image_layer_files(tool, container_id)
+    if layer_files is None:
+        return None
+    if path in layer_files:
+        runtime = runtime_added_files(tool, container_id)
+        if runtime and path in runtime:
+            return False
+        return True
+    return False
+
+
 def container_provenance(proc: "ProcessInfo", evidence: List[str]) -> Tuple[TrustLevel, List[str]]:
     """Provenance of a container process from the package database inside its own root.
 
@@ -4303,9 +4371,17 @@ def container_provenance(proc: "ProcessInfo", evidence: List[str]) -> Tuple[Trus
                                                  package=name.split()[0])
                 evidence.append(f"{proc.path} installed in image by {installer} ({name})")
                 return TrustLevel.CONTAINER, evidence
+            placed = image_build_placed(proc.pid, proc.path)
+            if placed:
+                proc.provenance = ProvenanceInfo(ownership="owned", signature="unknown", manager="image layer")
+                evidence.append(f"{proc.path} was put there by the image build (no package owns it)")
+                return TrustLevel.CONTAINER, evidence
             proc.provenance = ProvenanceInfo(ownership="unowned", signature="unknown")
             proc.container_unowned = True
-            evidence.append(f"{proc.path} is not part of the container image (no package in the image owns it)")
+            if placed is False:
+                evidence.append(f"{proc.path} was added after the container started (not in any image layer)")
+            else:
+                evidence.append(f"{proc.path} is not part of the container image (no package in the image owns it)")
             return TrustLevel.UNKNOWN, evidence
         manager = file_package_cache.get_manager(proc.path) or ""
         level, info = verify_package_provenance(proc.path)
