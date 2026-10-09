@@ -318,3 +318,52 @@ class WholeRunFetchTests(CampaignBox):
         self.assertEqual(text.count("known-bad list not fetched"), 1, text)
         self.assertIn("known-bad list: not available", text)
         self.assertIn(code, (0, 1))
+
+
+class AddressFallbackTests(unittest.TestCase):
+    """A dead IPv6 route must not stop the fetch when IPv4 works (errno 101 on the author's laptop)."""
+
+    def test_download_falls_through_dead_ipv6(self):
+        import http.server
+        import socket
+        import ssl
+        import subprocess
+        import tempfile
+        import threading
+        sys.path.insert(0, os.path.dirname(__file__))
+        from helpers import load_weird
+        tmp = Path(tempfile.mkdtemp(prefix="weird-tls-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(tmp / "k.pem"),
+                        "-out", str(tmp / "c.pem"), "-days", "1", "-subj", "/CN=localhost"],
+                       check=True, capture_output=True)
+        (tmp / "campaigns.json").write_text('{"campaigns": []}')
+
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), lambda *a, **k: Quiet(*a, directory=str(tmp), **k))
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(tmp / "c.pem"), str(tmp / "k.pem"))
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+
+        weird = load_weird(tmp / "home")
+        real = socket.getaddrinfo
+
+        def dead_v6_first(host, *a, **k):
+            if host == "github.com":
+                return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:50c0:8000::154", port, 0, 0)),
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+            return real(host, *a, **k)
+
+        client = ssl.create_default_context()
+        client.check_hostname = False
+        client.verify_mode = ssl.CERT_NONE
+        with mock.patch.object(socket, "getaddrinfo", dead_v6_first), \
+                mock.patch.object(weird, "CAMPAIGNS_SSL_CONTEXT", client):
+            data = weird.download_url(f"https://github.com:{port}/campaigns.json")
+        self.assertEqual(json.loads(data), {"campaigns": []})

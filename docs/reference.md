@@ -365,7 +365,7 @@ no. It never asks without a terminal, under `--json` or `--ndjson`, in watch
 mode, on the timer (the shipped unit sets WEIRD_NO_PROMPT=1), or with
 `--no-prompt`. `weird dev aur --campaigns PATH` uses a file you supply and
 never fetches; `--fetch-campaigns` downloads without asking (https only, 20 s,
-5 MB, redirects away from github.com refused). A failed download prints one
+5 MB, redirects away from github.com refused; every address DNS returns is tried in turn, so a host with a dead IPv6 route still reaches GitHub over IPv4). A failed download prints one
 line and the run continues.
 
 ### Network inspection (what it actually does)
