@@ -288,3 +288,33 @@ class FetchTests(CampaignBox):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WholeRunFetchTests(CampaignBox):
+    """The main command with --fetch-campaigns: a failed fetch must not turn into a question."""
+
+    def test_failed_explicit_fetch_never_prompts(self):
+        self.foreign("harmless")
+        asked = []
+
+        def failing(*a, **k):
+            raise self.weird.CampaignFetchError("network is unreachable")
+
+        def fake_ask(question):
+            asked.append(question)
+            return "y"
+
+        args = self.weird.build_parser().parse_args(
+            ["--fetch-campaigns", "--no-baseline", "--skip", "hidden", "--skip", "processes",
+             "--skip", "persist", "--skip", "kernel", "--skip", "stale"])
+        out = io.StringIO()
+        with mock.patch.object(self.weird, "fetch_campaigns", failing), \
+                mock.patch.object(self.weird, "prompt_allowed", lambda a: True), \
+                mock.patch("builtins.input", fake_ask), \
+                contextlib.redirect_stdout(out):
+            code = self.weird.cmd_all(args)
+        text = out.getvalue()
+        self.assertEqual(asked, [], text)
+        self.assertEqual(text.count("known-bad list not fetched"), 1, text)
+        self.assertIn("known-bad list: not available", text)
+        self.assertIn(code, (0, 1))

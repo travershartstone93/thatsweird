@@ -11543,7 +11543,8 @@ def dev_args(main_args, words: List[str], parser: argparse.ArgumentParser) -> ar
     args, extra = parser.parse_known_args(words)
     if extra:
         parser.parse_args(extra, namespace=args)
-    for key in ("verbose", "json", "ndjson", "journal", "prometheus", "deep", "proc_root", "sysroot", "debug_log"):
+    for key in ("verbose", "json", "ndjson", "journal", "prometheus", "deep", "proc_root", "sysroot", "debug_log",
+                "campaigns", "fetch_campaigns", "campaigns_asked", "no_prompt"):
         if getattr(main_args, key, None) and not getattr(args, key, None):
             setattr(args, key, getattr(main_args, key))
     return args
@@ -11866,6 +11867,7 @@ def run_all(args) -> Tuple[Dict, Dict, int, Dict]:
         if chosen is not None:
             args.campaigns = str(chosen)
         args.campaigns_asked = True
+        args.fetch_campaigns = False
     plan = [
         ("processes", cmd_scan, "Processes", {}),
         ("aur", cmd_aur, "AUR packages", {}),
