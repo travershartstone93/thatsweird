@@ -10240,7 +10240,7 @@ def language_cache_findings() -> List[Finding]:
 # Known-bad AUR package lists (campaigns from github.com/lenucksi/aur-malware-check)
 # -----------------------------------------------------------------------------
 
-CAMPAIGNS_URL = "https://raw.githubusercontent.com/lenucksi/aur-malware-check/main/data/campaigns.json"
+CAMPAIGNS_URL = "https://raw.githubusercontent.com/lenucksi/aur-malware-check/master/data/campaigns.json"
 CAMPAIGNS_DIR = CONFIG_DIR / "campaigns"
 CAMPAIGNS_FILE = CAMPAIGNS_DIR / "campaigns.json"
 CAMPAIGNS_META = CAMPAIGNS_DIR / "meta.json"
@@ -11499,6 +11499,9 @@ def build_parser(with_verbs: bool = False) -> argparse.ArgumentParser:
     parser.add_argument("--skip", action="append", default=[], choices=SECTIONS, metavar="SECTION",
                         help="Leave out a section (repeatable): " + ", ".join(SECTIONS))
     parser.add_argument("--no-prompt", dest="no_prompt", action="store_true", help="Never ask questions (list fetch, baseline save)")
+    parser.add_argument("--campaigns", metavar="PATH", help="Use this known-bad AUR package list file (never fetch, never ask)")
+    parser.add_argument("--fetch-campaigns", dest="fetch_campaigns", action="store_true",
+                        help="Download or update the known-bad AUR package list now, without asking")
     parser.add_argument("--save-baseline", dest="save_baseline", action="store_true",
                         help="Record this run as the baseline, without asking")
     parser.add_argument("--no-baseline", dest="no_baseline", action="store_true",

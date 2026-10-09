@@ -17,6 +17,8 @@ complete -c weird -n "__weird_no_subcommand" -l deep -d "Hash every packaged exe
 complete -c weird -n "__weird_no_subcommand" -l offline -r -F -d "Live-media mode"
 complete -c weird -n "__weird_no_subcommand" -l skip -x -d "Leave out a section"
 complete -c weird -n "__weird_no_subcommand" -l no-prompt -d "Never ask questions"
+complete -c weird -n "__weird_no_subcommand" -l campaigns -r -F -d "Use this known-bad AUR package list file"
+complete -c weird -n "__weird_no_subcommand" -l fetch-campaigns -d "Download or update the known-bad AUR package list now, without asking"
 complete -c weird -n "__weird_no_subcommand" -l save-baseline -d "Record this run as the baseline, without asking"
 complete -c weird -n "__weird_no_subcommand" -l no-baseline -d "Skip the comparison with the saved baseline"
 complete -c weird -n "__weird_no_subcommand" -l proc-root -r -F -d "Read process info from DIR instead of /proc"

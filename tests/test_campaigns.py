@@ -227,7 +227,7 @@ class FetchTests(CampaignBox):
 
         def download(url):
             calls.append(url)
-            base = "https://raw.githubusercontent.com/lenucksi/aur-malware-check/main/"
+            base = "https://raw.githubusercontent.com/lenucksi/aur-malware-check/master/"
             self.assertTrue(url.startswith(base), url)
             rel = url[len(base):]
             if rel == "data/campaigns.json":

@@ -6,7 +6,7 @@ weird \- one-command Linux host check without root
 [\fB\-v\fR] [\fB\-\-deep\fR] [\fB\-\-json\fR | \fB\-\-ndjson\fR]
 [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
 [\fB\-\-skip\fR \fISECTION\fR]... [\fB\-\-offline\fR \fISYSROOT\fR]
-[\fB\-\-no\-prompt\fR]
+[\fB\-\-no\-prompt\fR] [\fB\-\-campaigns\fR \fIPATH\fR] [\fB\-\-fetch\-campaigns\fR]
 [\fB\-\-proc\-root\fR \fIDIR\fR] [\fB\-\-sysroot\fR \fIDIR\fR]
 .br
 .B weird
@@ -205,8 +205,13 @@ sets the exit status: 2 if any critical, 1 if any medium or warning, 0 otherwise
 aur, persist, kernel, stale, hidden; repeatable). \fB\-\-json\fR prints one object
 with a key per section plus "summary". \fB\-\-offline\fR \fISYSROOT\fR runs the
 live\-media checks (persist, integrity, aur) against a mounted disk with no process
-or hidden sections. \fB\-\-no\-prompt\fR never asks a question (today the
-only one is the known\-bad list download).
+or hidden sections. \fB\-\-no\-prompt\fR never asks a question (the known\-bad
+list download and the baseline save).
+.TP
+\fB\-\-fetch\-campaigns\fR
+Download or update the known-bad AUR package list now, without asking, into
+~/.config/weird/campaigns/. \fB\-\-campaigns\fR \fIPATH\fR uses a list file you
+obtained yourself and never fetches or asks.
 .TP
 .B \fIPID\fR | \fIPATH\fR
 A number inspects that process (provenance, integrity, mappings, environment,

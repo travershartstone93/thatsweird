@@ -70,7 +70,7 @@ sections that finished, the one it landed in, a partial summary; exit 130.
 
 | Command | What it does |
 | --- | --- |
-| `weird` | The whole report; `--skip SECTION` leaves one out, `--offline SYSROOT` checks a mounted disk, `--save-baseline` records the baseline, `--no-baseline` skips it, `--no-prompt` never asks a question |
+| `weird` | The whole report; `--skip SECTION` leaves one out, `--offline SYSROOT` checks a mounted disk, `--save-baseline` records the baseline, `--no-baseline` skips it, `--no-prompt` never asks a question, `--fetch-campaigns` downloads the known-bad AUR list now, `--campaigns PATH` uses your own copy |
 | `weird PID` or `weird PATH` | Everything weird knows about one process or one file |
 | `weird trust PID\|PATH` | Pin an executable's hash so scans stay quiet until the file changes; `weird untrust PATH` removes it |
 | `weird watch` | One NDJSON line per new flagged process; `--events PATH` reads weird-sensor, `--falco` runs Falco |
