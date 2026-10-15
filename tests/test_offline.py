@@ -46,10 +46,9 @@ class Offline(OfflineBox):
     def test_clean_disk_is_exit_0(self):
         out, err, code = self.offline()
         self.assertEqual(code, 0, out + err)
-        self.assertIn("Offline check of", out)
-        self.assertIn("every persistence entry launches a packaged, intact executable", out)
-        self.assertIn("2 executables under /usr/bin and /usr/lib: 2 checked, 2 intact, 0 modified", out)
-        self.assertIn("0 critical, 0 medium, 0 low, 0 info", out)
+        self.assertIn("Nothing weird on the disk mounted at", " ".join(out.split()))
+        self.assertIn("Checked without running anything from the disk", " ".join(out.split()))
+        self.assertIn("2 programs under /usr/bin and /usr/lib: 2 intact, 0 changed", " ".join(out.split()))
 
     def test_unowned_hook_is_critical(self):
         make_stub_file(self.sysroot, "/usr/bin/evil-sync")
@@ -65,7 +64,7 @@ class Offline(OfflineBox):
         self.assertEqual(payload["sections"]["integrity"]["counts"]["unowned"], 1)
         out, _, code = self.offline()
         self.assertEqual(code, 2)
-        self.assertIn("pacman hook", out)
+        self.assertIn("evil-sync runs during package installs", " ".join(out.split()))
 
     def test_modified_packaged_binary_is_critical(self):
         append_byte(self.sysroot, "/usr/bin/bash")
@@ -80,7 +79,7 @@ class Offline(OfflineBox):
         self.assertIn("package bash", hit["detail"])
         self.assertEqual(payload["sections"]["persist"]["counts"]["critical"], 0)
         out, _, _ = self.offline()
-        self.assertIn("/usr/bin/bash differs from what package bash installed", out)
+        self.assertIn("/usr/bin/bash was changed after bash installed it", " ".join(out.split()))
 
     def test_limit_caps_the_walk(self):
         payload, code = self.offline_json(limit=1)
@@ -88,7 +87,7 @@ class Offline(OfflineBox):
         self.assertEqual(payload["sections"]["integrity"]["counts"]["examined"], 1)
         self.assertEqual(payload["sections"]["integrity"]["limit"], 1)
         out, _, _ = self.offline(limit=1)
-        self.assertIn("(first 1)", out)
+        self.assertIn("under /usr/bin and /usr/lib, the first 1:", " ".join(out.split()))
 
     def test_symlinks_and_non_executables_are_skipped(self):
         make_stub_file(self.sysroot, "/usr/lib/data.txt").chmod(0o644)
@@ -124,7 +123,7 @@ class Offline(OfflineBox):
         payload, code = self.offline_json()
         self.assertIsNone(payload["sections"]["aur"])
         out, _, _ = self.offline()
-        self.assertIn("no pacman local database under the sysroot", out)
+        self.assertIn("No pacman database on this disk.", " ".join(out.split()))
 
     def test_refuses_root_without_force(self):
         out, err, code = self.offline(sysroot="/")

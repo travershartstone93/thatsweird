@@ -1,4 +1,4 @@
-"""Baseline by default: the first-run question, the changes section, the progress line and Ctrl-C."""
+"""Baseline by default: every run records one, the changes section, the progress line and Ctrl-C."""
 import contextlib
 import hashlib
 import io
@@ -34,27 +34,12 @@ class BaselineBox(ReportBox):
         os.environ.pop("WEIRD_NO_PROMPT", None)
         self.baseline_file = self.home / ".config/weird/baseline.json"
 
-    def interactive_report(self, answer, *words):
-        """A run on a fake terminal (stdin and stdout) that answers the baseline question."""
-        out = Tty()
-        argv = ["--proc-root", str(self.proc), "--sysroot", str(self.sysroot), *words]
-        # the known-bad list question comes first on a terminal and is always declined here
-        reply = lambda question: answer if "baseline" in question else "n"  # noqa: E731
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
-                mock.patch.object(sys, "stdin", Tty()), \
-                mock.patch.object(self.weird, "fetch_campaigns", side_effect=AssertionError("fetch")), \
-                mock.patch("builtins.input", side_effect=reply) as asked:
-            code = self.weird.main(argv)
-        asked.called = any("baseline" in c.args[0] for c in asked.call_args_list)
-        return out.getvalue(), code, asked
-
     def quiet_report(self, *words):
         with mock.patch("builtins.input", no_question):
             return self.report(*words)
 
     def save_first(self):
-        text, code, asked = self.interactive_report("y")
-        self.assertTrue(asked.called)
+        text, code = self.quiet_report()
         self.assertTrue(self.baseline_file.is_file())
         return text
 
@@ -63,10 +48,10 @@ class BaselineBox(ReportBox):
 
 
 class FirstRun(BaselineBox):
-    def test_interactive_first_run_writes_version_2(self):
+    def test_first_run_writes_version_2_without_a_question(self):
         text = self.save_first()
-        self.assertNotIn("== Changes", text)
-        self.assertIn("baseline saved to", text)
+        self.assertNotIn("Compared with your last run", text)
+        self.assertIn("First run: weird saved what this machine looks like now", " ".join(text.split()))
         data = self.baseline()
         self.assertEqual(data["version"], 2)
         for part in ("processes", "persistence", "packages", "posture"):
@@ -77,30 +62,37 @@ class FirstRun(BaselineBox):
         self.assertEqual(data["posture"]["module_loading"], "open")
         self.assertEqual(stat.S_IMODE(self.baseline_file.stat().st_mode), 0o600)
 
-    def test_enter_means_yes_and_n_means_no(self):
-        text, code, asked = self.interactive_report("n")
-        self.assertTrue(asked.called)
-        self.assertFalse(self.baseline_file.exists())
-        self.assertNotIn("baseline saved", text)
-        text, code, asked = self.interactive_report("")
+    def test_a_terminal_is_not_asked_about_the_baseline(self):
+        out = Tty()
+        argv = ["--proc-root", str(self.proc), "--sysroot", str(self.sysroot)]
+        self.weird.set_config_value("online", False)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(sys, "stdin", Tty()), mock.patch("builtins.input", no_question):
+            code = self.weird.main(argv)
+        self.assertEqual(code, 0, out.getvalue())
         self.assertTrue(self.baseline_file.is_file())
+        self.assertNotIn("online checks not enabled", out.getvalue())
 
-    def test_non_interactive_first_run_writes_nothing(self):
-        text, code = self.quiet_report()
+    def test_json_run_writes_the_baseline_and_never_asks(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(sys, "stdin", Tty()), mock.patch("builtins.input", no_question):
+            self.weird.main(["--proc-root", str(self.proc), "--sysroot", str(self.sysroot), "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertTrue(self.baseline_file.is_file())
+        self.assertEqual(payload["online"], {"enabled": False, "note": self.weird.ONLINE_NOTE})
+
+    def test_save_baseline_flag_says_so(self):
+        self.save_first()
+        text, code = self.quiet_report("--save-baseline")
+        self.assertIn("Saved this machine's current state in ~/.config/weird/baseline.json.", " ".join(text.split()))
+        self.assertEqual(self.baseline()["version"], 2)
+
+    def test_no_baseline_neither_compares_nor_records(self):
+        text, code = self.quiet_report("--no-baseline")
         self.assertEqual(code, 0, text)
         self.assertFalse(self.baseline_file.exists())
         self.assertNotIn("baseline", text)
-
-    def test_json_never_asks(self):
-        with contextlib.redirect_stdout(Tty()), mock.patch.object(sys, "stdin", Tty()), \
-                mock.patch("builtins.input", no_question):
-            self.weird.main(["--proc-root", str(self.proc), "--sysroot", str(self.sysroot), "--json"])
-        self.assertFalse(self.baseline_file.exists())
-
-    def test_save_baseline_flag_writes_without_a_question(self):
-        text, code = self.quiet_report("--save-baseline")
-        self.assertIn("baseline saved to", text)
-        self.assertEqual(self.baseline()["version"], 2)
 
     def test_dev_baseline_init_keeps_version_2(self):
         out = io.StringIO()
@@ -118,39 +110,34 @@ class LaterRuns(BaselineBox):
         self.save_first()
         text, code = self.quiet_report()
         self.assertEqual(code, 0, text)
-        self.assertTrue(text.startswith("== Changes since "), text)
-        self.assertIn("nothing changed (1 process, 0 persistence entries, 0 foreign packages, kernel posture compared)", text)
+        flat = " ".join(text.split())
+        self.assertIn("Compared with your last run on", flat)
+        self.assertIn("Nothing changed since", flat)
+        self.assertIn("(1 process, 0 persistence entries, 0 foreign packages, kernel posture compared).", flat)
         self.assertNotIn("--save-baseline", text)
-        self.assertEqual(self.baseline_file.stat().st_mtime_ns, self.baseline_mtime)
+        self.assertNotIn("Saved this machine", text)
+        self.assertTrue(self.baseline_file.is_file())
 
-    def save_first(self):
-        text = super().save_first()
-        self.baseline_mtime = self.baseline_file.stat().st_mtime_ns
-        return text
-
-    def test_new_unit_appears_under_changes(self):
+    def test_new_unit_appears_once_then_becomes_the_baseline(self):
         self.save_first()
         make_stub_file(self.sysroot, "/tmp/decoy")
         self.sys_file("/etc/systemd/system/decoy.service", "[Service]\nExecStart=/tmp/decoy\n")
         text, code = self.quiet_report()
         self.assertEqual(code, 2, text)
-        changes = text.split("== Processes ==")[0]
-        self.assertIn("new persistence entry", changes)
-        self.assertIn("ExecStart in /etc/systemd/system/decoy.service runs /tmp/decoy", changes)
-        self.assertIn("medium", changes)
-        self.assertIn("1 change: 0 critical, 1 medium, 0 low, 0 info", changes)
-        self.assertIn("baseline from ", text)
-        self.assertIn("run `weird --save-baseline` to accept the current state", text)
-        self.assertEqual(self.baseline_file.stat().st_mtime_ns, self.baseline_mtime)
+        flat = " ".join(text.split())
+        self.assertIn("New since your last run: decoy starts at boot", flat)
+        self.assertIn("/etc/systemd/system/decoy.service runs /tmp/decoy. If you added it, there is nothing to do", flat)
+        self.assertIn("Changes 1 change since", flat)
+        self.assertIn("all listed above.", flat)
+        self.assertNotIn("--save-baseline", text)
+        self.assertEqual(len(self.baseline()["persistence"]), 1)
 
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch("builtins.input", no_question):
             self.weird.main(["--proc-root", str(self.proc), "--sysroot", str(self.sysroot), "--json"])
         payload = json.loads(out.getvalue())
-        kinds = [(f["kind"], f["severity"]) for f in payload["changes"]["findings"]]
-        self.assertEqual(kinds, [("new persistence entry", "medium")])
-        self.assertEqual(payload["changes"]["counts"]["medium"], 1)
-        self.assertEqual(payload["summary"]["medium"], 1)
+        self.assertEqual(payload["changes"]["findings"], [])
+        self.assertEqual(payload["summary"]["medium"], 0)
         self.assertNotIn("interrupted", payload)
 
     def test_replaced_executable_is_a_hash_change(self):
@@ -159,9 +146,9 @@ class LaterRuns(BaselineBox):
         exe.write_bytes(b"#!/bin/sh\necho replaced\n")
         os.utime(exe, ns=(exe.stat().st_atime_ns, exe.stat().st_mtime_ns + 10 ** 10))
         text, code = self.quiet_report()
-        changes = text.split("== Processes ==")[0]
-        self.assertIn("process hash changed", changes)
-        self.assertIn("bash: /usr/bin/bash is not the file the baseline recorded", changes)
+        flat = " ".join(text.split())
+        self.assertIn("Changed since your last run: bash", flat)
+        self.assertIn("/usr/bin/bash is not the same file as at your last run", flat)
 
     def test_version_1_baseline_is_read(self):
         digest = hashlib.sha256((self.sysroot / "usr/bin/bash").read_bytes()).hexdigest()
@@ -173,14 +160,16 @@ class LaterRuns(BaselineBox):
         }))
         text, code = self.quiet_report()
         self.assertEqual(code, 0, text)
-        self.assertIn("== Changes since 2023-11-1", text)
-        self.assertIn("nothing changed (1 process compared)", text)
+        self.assertIn("Compared with your last run on Nov 1", text)
+        self.assertIn("(1 process compared).", " ".join(text.split()))
+        self.assertEqual(self.baseline()["version"], 2)
 
     def test_no_baseline_skips_the_section(self):
         self.save_first()
         text, code = self.quiet_report("--no-baseline")
         self.assertNotIn("Changes", text)
-        self.assertTrue(text.startswith("== Processes =="), text)
+        self.assertNotIn("Compared with", text)
+        self.assertTrue(text.startswith("Nothing weird on"), text)
 
 
 class ProgressLine(BaselineBox):
@@ -211,8 +200,9 @@ class ProgressLine(BaselineBox):
         self.assertIn("\r", terminal)
         report = report_file.read_text()
         self.assertNotIn("checking", report)
-        self.assertIn("summary:", report)
-        self.assertNotIn("Save this run", terminal)
+        self.assertTrue(report.startswith("Nothing weird on"), report)
+        self.assertIn("Everything else", report)
+        self.assertNotIn("OK? [Y/n]", terminal)
 
     def test_nothing_on_a_piped_stderr(self):
         err = io.StringIO()
@@ -224,6 +214,12 @@ class ProgressLine(BaselineBox):
 
 
 class CtrlC(BaselineBox):
+    def setUp(self):
+        super().setUp()
+        # a suite started in the background inherits an ignored SIGINT
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, previous)
+
     def slow_hidden(self, *args, **kwargs):
         threading.Timer(0.5, os.kill, [os.getpid(), signal.SIGINT]).start()
         time.sleep(30)
@@ -233,11 +229,11 @@ class CtrlC(BaselineBox):
         with mock.patch.object(self.weird, "find_hidden_pids", self.slow_hidden):
             text, code = self.quiet_report()
         self.assertEqual(code, 130, text)
-        self.assertIn("== Processes ==", text)
-        self.assertIn("== Kernel ==", text)
-        self.assertNotIn("== Hidden processes ==", text)
-        self.assertIn("interrupted during hidden processes", text)
-        self.assertIn("(exit 130) (partial)", text)
+        self.assertIn("Running programs", text)
+        self.assertIn("Kernel modules", text)
+        self.assertNotIn("Hidden processes", text)
+        self.assertIn("Stopped early during hidden processes: this report covers only the parts that finished.",
+                      " ".join(text.split()))
         self.assertFalse(self.baseline_file.exists())
 
     def test_sigint_under_json_is_still_json(self):

@@ -38,27 +38,25 @@ class OneCommandTests(PersistBox):
 
     def test_plain_run_prints_every_section_and_a_summary(self):
         text, code = self.weird_main()
-        for title in ("== Processes ==", "== AUR packages ==", "== Persistence ==", "== Kernel ==",
-                      "== Hidden processes =="):
-            self.assertIn(title, text)
-        self.assertNotIn("== Stale binaries", text)
-        self.assertRegex(text.splitlines()[-1],
-                         r"^summary: \d+ to look at \(\d+ critical, \d+ medium, \d+ low\), "
-                         r"\d+ entries are your own unpackaged software, \d+ info \(exit 0\)$")
+        for label in ("Running programs", "AUR packages", "Startup programs", "Kernel modules", "Hidden processes"):
+            self.assertIn(f"\n  {label}", text)
+        self.assertNotIn("Old files in use", text)
+        self.assertRegex(text.splitlines()[0], r"^Nothing weird on \S+\.$")
+        self.assertEqual(text.splitlines()[-1], "weird -v lists everything; weird 1234 explains process 1234.")
         self.assertEqual(code, 0, text)
 
     def test_exit_code_aggregates_across_sections(self):
         self.sys_file("/etc/ld.so.preload", "/tmp/evil.so\n")
         text, code = self.weird_main()
         self.assertEqual(code, 2, text)
-        self.assertIn("summary: 1 to look at (1 critical", text)
-        self.assertIn("(exit 2)", text)
+        self.assertRegex(text.splitlines()[0], r"^1 thing on \S+ needs you to act now\.$")
+        self.assertIn("Every program loads /tmp/evil.so", text)
 
     def test_skip_omits_a_section(self):
         text, code = self.weird_main("--skip", "hidden", "--skip", "kernel")
-        self.assertNotIn("== Hidden processes ==", text)
-        self.assertNotIn("== Kernel ==", text)
-        self.assertIn("== Persistence ==", text)
+        self.assertNotIn("Hidden processes", text)
+        self.assertNotIn("Kernel modules", text)
+        self.assertIn("Startup programs", text)
 
     def test_json_has_a_key_per_section(self):
         text, code = self.weird_main("--json")

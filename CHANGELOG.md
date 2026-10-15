@@ -1,5 +1,87 @@
 # Changelog
 
+## 1.5.0
+
+Review response (an external code review, addressed point by point):
+
+- The weirdness score is capped at the 100 its output has always claimed;
+  a process with every red flag at once prints 100/100, not past it.
+- The test sandbox root proves its own path is neutral: a clone under /tmp
+  (or anywhere the suspicious-path policy names) passes its full suite.
+- signals.memfd_allow in config.toml: fnmatch patterns for memfd names your
+  own tools create, so a legitimate sandbox or telemetry collector is one
+  line away from quiet; the critical finding now says so.
+- The two largest functions (scoring and the process detail report) are
+  split into single-purpose helpers, same file, same behaviour, pinned by
+  the suite before and after.
+
+Publisher verification. An executable no package owns used to stay "unpackaged"
+for ever; now weird asks its publisher. The file itself says where it came from
+(its install path, such as ~/.local/share/claude/versions/2.1.296, the ELF
+package note, Go build information, and the https addresses in its bytes, read
+in 1 MB chunks and cached per path, inode, size, mtime and ctime in
+~/.config/weird/claims.json),
+and the proof is looked for at the conventional places under those addresses:
+`<base>/<version>/manifest.json`, SHA256SUMS, checksums.txt, GitHub release
+assets, with .sig, .asc or .minisig next to them and keys at /keys/<product>.asc
+and the like on the same host, or the key a signature names on keys.openpgp.org.
+No publisher address is written into the code. TLS vouches for the host, a
+signature by a key that host serves vouches for the list, and the file's own
+sha256 (or sha512) must appear in it. Two new trust levels: PUBLISHER_SIGNED
+(signed list, hash present) and PUBLISHER_HOSTED (an unsigned checksum list read
+over TLS from the publisher's host). A list that should name the file and does
+not, or a signature that fails under the host's keys, is `publisher_mismatch`
+(+60, T1554) and the verdict is "Likely malicious". Nothing published, no
+network, or offline leaves the file "unverifiable" (info, never scored), and it
+stays listed that way on every run until it can be verified. Verified status is
+never inherited: every file is checked against its own published hash. Only a
+manager's claim is handed down to a program under the identified binary's install
+root (llama-server under /usr/local/lib/ollama follows ollama). The first key that verifies a host's
+list is pinned under ~/.config/weird/publishers/<host>/; a new key from the same
+host is accepted and reported once as medium "publisher key changed". Results
+are cached per file hash so the same bytes are never verified twice, 404s are
+remembered for a day, new probes get eight seconds of network time per run and
+anything beyond is "verification pending" until the next run. The binary is never
+executed. `weird PID` and the JSON output carry the result under "publisher".
+
+One question, ever. The first run on a terminal asks "weird can go online to
+check your software against publishers' signed lists and the known-bad AUR list.
+OK? [Y/n]", Enter means yes, and the answer is stored as `online` in
+~/.config/weird/config.toml. Without a terminal, under `--json`, `--ndjson`,
+`watch`, `--no-prompt` or WEIRD_NO_PROMPT the question is not asked, the run
+stays offline and the report says "online checks not enabled: run weird once in
+a terminal to answer". `--offline` alone forces a run offline; with a SYSROOT it
+is still the live-media mode. The known-bad AUR list and the baseline no longer
+ask anything: the list is fetched or refreshed silently when weird may go online
+and it is missing or older than campaigns_max_age_days, and every completed run
+records the baseline, so "Changes since <date>" now means since the previous run
+(`--save-baseline` says so in one line, `--no-baseline` neither compares nor
+records). The GitHub and npm description lookups follow the same switch.
+
+Persistence follows the same verdicts. An entry whose target lives outside the
+home and is owned by no distribution package is checked against its publisher
+too: verified is info (trust PUBLISHER_SIGNED or PUBLISHER_HOSTED), a target
+only a package manager names, such as a Go binary's build information, is low,
+a publisher mismatch is critical, and anything else keeps its severity, so a
+hand-written script in /usr/local still reads medium.
+
+A new report. Instead of a table per section, weird prints its findings in one
+piece once every section has run: one sentence about the machine ("Nothing weird
+on whisper."), then each item under "Act now", "Worth a look" or "Minor", titled
+with the real name of the thing and explained in plain sentences (what it is,
+why it is listed, what to do), then "Everything else", one line per section,
+which also names the programs verified with their publishers. Text wraps at 78
+columns without splitting paths, and colour is only used on a terminal. Trust
+levels, ATT&CK ids and check names moved to -v. Kernel taint items name the
+modules behind them and where they came from: drivers from a package the
+distribution signed are no longer listed, and an unsigned DKMS driver reads as
+minor, saying when its source package comes from the AUR; a plain http source whose checksum
+the build recipe pins is low rather than medium; the pacman LocalFileSigLevel
+note moved under AUR packages in -v. `weird PID` follows the same style: a
+verdict, the warning signs, where the program came from and a short fact sheet
+naming the program by what it runs, with open files, the full process tree and
+the technical notes under -v; command lines are shown sanitised.
+
 ## 1.4.0
 
 Later in 1.4.0: the known-bad list is fetched once, up front, and tries every

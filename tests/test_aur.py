@@ -94,12 +94,12 @@ class GitHistory(AurBox):
         self.assertIn("same version, content changed", hit[0]["detail"])
         self.assertIn("together with an insecure source", hit[0]["detail"])
         insecure = self.by_kind(payload, "insecure source")
-        self.assertEqual(insecure[0]["severity"], "medium")
+        self.assertEqual(insecure[0]["severity"], "low")
         self.assertIn("http://evil.example/foo.sh is fetched over http", insecure[0]["detail"])
         out, code = self.aur()
         self.assertEqual(code, 2)
-        self.assertIn("PKGBUILD modified after install", out)
-        self.assertIn("1 file changed", out)
+        self.assertIn("foo's build recipe changed after you installed it", out)
+        self.assertIn("downloads over an insecure connection", " ".join(out.split()))
 
     def test_newer_commit_alone_is_medium(self):
         self.foreign()
@@ -121,8 +121,8 @@ class GitHistory(AurBox):
         self.assertEqual(payload["findings"], [])
         self.assertEqual(payload["packages"][0]["pkgbuild"], str(directory / "PKGBUILD"))
         out, code = self.aur()
-        self.assertIn("Every checked PKGBUILD fetches over https", out)
-        self.assertIn("1 foreign packages, 1 PKGBUILDs checked: 0 critical, 0 medium, 0 low, 0 info", out)
+        self.assertIn("Nothing weird in the AUR packages", out)
+        self.assertIn("1 installed; 1 of their build recipes were checked.", out)
 
     def test_uncommitted_pkgver_bump_is_info(self):
         self.foreign(version="r10.abc-1")
@@ -149,15 +149,28 @@ class GitHistory(AurBox):
 class Sources(AurBox):
     def test_insecure_source_flagged(self):
         self.foreign()
-        self.clone(pkgbuild("'http://example.org/foo-1.0.tar.gz'"))
+        directory = self.clone(pkgbuild("'http://example.org/foo-1.0.tar.gz'", sums="md5sums=('SKIP')"))
         payload, code = self.aur_json()
         self.assertEqual(code, 1)
         hit = self.by_kind(payload, "insecure source")
         self.assertEqual((hit[0]["severity"], hit[0]["attack"]), ("medium", "T1195.001"))
         self.assertIn("no git history", [f["kind"] for f in payload["findings"]])
         out, _ = self.aur()
-        self.assertIn("insecure source", out)
-        self.assertIn("without TLS", out)
+        self.assertIn("foo downloads its source over plain http, unchecked", out)
+        self.assertIn("anyone on the network path could swap the file", " ".join(out.split()))
+
+    def test_insecure_source_with_a_pinned_checksum_is_low(self):
+        self.foreign()
+        directory = self.clone(pkgbuild("'http://example.org/foo-1.0.tar.gz'", sums="md5sums=('0123')"))
+        payload, code = self.aur_json()
+        self.assertEqual(code, 0)
+        hit = self.by_kind(payload, "insecure source")
+        self.assertEqual(hit[0]["severity"], "low")
+        self.assertIn("md5sums pins it", hit[0]["detail"])
+        out, _ = self.aur()
+        self.assertIn("foo downloads its source over plain http", out)
+        self.assertIn("pins its MD5 checksum", " ".join(out.split()))
+        self.assertIn("MD5 is old and weak", " ".join(out.split()))
 
     def test_paste_host_is_critical(self):
         self.foreign()
@@ -175,16 +188,16 @@ class Sources(AurBox):
                             "        'local.patch'",
                             sums="sha256sums=('a' 'b' 'c')"))
         payload, code = self.aur_json()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         details = [f["detail"] for f in self.by_kind(payload, "insecure source")]
-        self.assertEqual(details, ["http://mirror.example/extra.patch is fetched over http, not https"])
+        self.assertEqual(details, ["http://mirror.example/extra.patch is fetched over http, not https; sha256sums pins it"])
 
     def test_url_variable_expanded_in_source(self):
         self.foreign()
         text = pkgbuild("\"$url/foo-$pkgver.tar.gz\"").replace('url="https://example.org/foo"', 'url="http://example.org/foo"')
         self.clone(text)
         payload, code = self.aur_json()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertIn("http://example.org/foo/foo-1.0.tar.gz is fetched over http", self.by_kind(payload, "insecure source")[0]["detail"])
 
     def test_per_arch_source_arrays(self):
@@ -207,7 +220,7 @@ class Checksums(AurBox):
         self.assertEqual(hit[0]["severity"], "low")
         self.assertIn("https://example.org/foo-1.0.tar.gz is installed unverified", hit[0]["detail"])
         out, _ = self.aur()
-        self.assertIn("checksum SKIP", out)
+        self.assertIn("foo skips the checksum for one download", out)
 
     def test_missing_checksums_low(self):
         self.foreign()
@@ -245,9 +258,9 @@ class InstallAndLookup(AurBox):
         self.assertEqual((hit[0]["severity"], hit[0]["detail"]), ("info", "runs install script as root (foo.install)"))
         out, _ = self.aur()
         self.assertNotIn("install script", out)
-        self.assertIn("(-v lists the info entries)", out)
+        self.assertIn("weird -v lists everything", out)
         out, _ = self.aur(all=True)
-        self.assertIn("runs install script as root", out)
+        self.assertIn("foo runs an install script as root (foo.install)", out)
 
     def test_no_helper_cache(self):
         self.foreign()
@@ -259,7 +272,7 @@ class InstallAndLookup(AurBox):
         self.assertEqual(payload["packages"][0]["pkgbuild"], "")
         out, code = self.aur()
         self.assertEqual(code, 0)
-        self.assertIn("1 foreign packages, 0 PKGBUILDs checked", out)
+        self.assertIn("1 installed; 0 of their build recipes were checked.", out)
 
     def test_yay_cache_and_pkgbase(self):
         self.foreign(name="foo-bin")
@@ -268,7 +281,7 @@ class InstallAndLookup(AurBox):
         (pkgdir / "desc").write_text(desc)
         self.clone(pkgbuild("'http://example.org/foo-1.0.tar.gz'"), helper="yay")
         payload, code = self.aur_json()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertEqual(payload["packages"][0]["base"], "foo")
         self.assertTrue(payload["packages"][0]["pkgbuild"].endswith("/.cache/yay/foo/PKGBUILD"))
 
@@ -279,14 +292,24 @@ class InstallAndLookup(AurBox):
         (custom / "foo").mkdir(parents=True)
         (custom / "foo" / "PKGBUILD").write_text(pkgbuild("'http://example.org/foo-1.0.tar.gz'"))
         payload, code = self.aur_json(pkgbuild_dir=str(custom))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertEqual(payload["packages"][0]["pkgbuild"], str(custom / "foo" / "PKGBUILD"))
+
+    def test_local_signature_level_is_noted_with_minus_v(self):
+        self.foreign()
+        self.clone(pkgbuild("'https://example.org/foo-1.0.tar.gz'"))
+        out, _ = self.aur()
+        self.assertNotIn("LocalFileSigLevel", out)
+        out, _ = self.aur(all=True)
+        flat = " ".join(out.split())
+        self.assertEqual(flat.count("LocalFileSigLevel"), 1, out)
+        self.assertIn("pacman installs packages built here without checking a signature", flat)
 
     def test_no_foreign_packages(self):
         self.add_pkg("bash", "5.3-1", "/usr/bin/bash", repo="core", packager=ARCH)
         out, code = self.aur()
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "No foreign packages installed.")
+        self.assertIn("AUR packages   None installed.", out)
 
 
 class ForeignSelection(AurBox):

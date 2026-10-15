@@ -234,7 +234,7 @@ class InspectOutput(IntegrityBox):
         with contextlib.redirect_stdout(out):
             code = self.weird.cmd_inspect(argparse.Namespace(pid=100, enrich_net=False))
         self.assertEqual(code, 0)
-        self.assertIn("Integrity: intact (sha256 matches package bash mtree)", out.getvalue())
+        self.assertIn("Its file matches what the bash package installed.", " ".join(out.getvalue().split()))
 
     def test_inspect_flags_modified(self):
         self.official("bash", "5.3.15-2", BASH)
@@ -243,11 +243,11 @@ class InspectOutput(IntegrityBox):
         self.table[("pstree", "-p", "-s", "100")] = None
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.weird.cmd_inspect(argparse.Namespace(pid=100, enrich_net=False))
-        text = out.getvalue()
-        self.assertIn("Integrity: modified", text)
+            self.weird.cmd_inspect(argparse.Namespace(pid=100, enrich_net=False, verbose=True))
+        text = " ".join(out.getvalue().split())
+        self.assertIn("Its file differs from what the bash package installed", text)
         self.assertIn("T1554", text)
-        self.assertIn("Likely malicious", text)
+        self.assertIn("bash (pid 100) looks malicious", text)
 
 
 class SubprocessEconomy(IntegrityBox):

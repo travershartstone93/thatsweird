@@ -218,7 +218,7 @@ class PersistOutput(PersistBox):
         data = json.loads(out)
         self.assertEqual(code, 0)
         self.assertEqual(data["entries"], [])
-        self.assertEqual(data["counts"], {"critical": 0, "medium": 0, "info": 0, "yours": 0, "total": 0})
+        self.assertEqual(data["counts"], {"critical": 0, "medium": 0, "low": 0, "info": 0, "yours": 0, "total": 0})
         self.assertIn("host", data)
         self.assertIn("timestamp", data)
 
@@ -247,12 +247,12 @@ class PersistOutput(PersistBox):
         out, code = self.persist()
         self.assertEqual(code, 2)
         self.assertIn("/tmp/evil", out)
-        self.assertNotIn("/usr/bin/conky", out)
-        self.assertIn("1 critical, 0 medium, 0 your own unpackaged software, 1 info", out)
-        self.assertIn("T1543.002", out)
+        self.assertNotIn("conky", out)
+        self.assertIn("2 entries checked.", " ".join(out.split()))
+        self.assertNotIn("T1543.002", out)
         out, _ = self.persist(all=True)
-        self.assertIn("/usr/bin/conky", out)
-        self.assertIn("OFFICIAL", out)
+        self.assertIn("conky starts when you log in", " ".join(out.split()))
+        self.assertIn("T1543.002", " ".join(out.split()))
 
 
 class ArchHooks(PersistBox):
@@ -362,7 +362,7 @@ class DeveloperHome(PersistBox):
         self.assertEqual((counts["critical"], counts["medium"], counts["yours"]), (0, 1, 6))
         out, code = self.persist()
         self.assertEqual(code, 1)
-        self.assertIn("0 critical, 1 medium, 6 your own unpackaged software, 0 info", out)
+        self.assertIn("6 of them your own scripts.", " ".join(out.split()))
         self.assertNotIn("splashfetch", out)
         out, _ = self.persist(all=True)
         self.assertIn("splashfetch", out)

@@ -1,11 +1,11 @@
-.TH WEIRD 1 "October 6, 2026" "weird 1.3.0" "User Commands"
+.TH WEIRD 1 "October 9, 2026" "weird 1.5.0" "User Commands"
 .SH NAME
 weird \- one-command Linux host check without root
 .SH SYNOPSIS
 .B weird
 [\fB\-v\fR] [\fB\-\-deep\fR] [\fB\-\-json\fR | \fB\-\-ndjson\fR]
 [\fB\-\-journal\fR] [\fB\-\-prometheus\fR \fIPATH\fR]
-[\fB\-\-skip\fR \fISECTION\fR]... [\fB\-\-offline\fR \fISYSROOT\fR]
+[\fB\-\-skip\fR \fISECTION\fR]... [\fB\-\-offline\fR [\fISYSROOT\fR]]
 [\fB\-\-no\-prompt\fR] [\fB\-\-campaigns\fR \fIPATH\fR] [\fB\-\-fetch\-campaigns\fR]
 [\fB\-\-proc\-root\fR \fIDIR\fR] [\fB\-\-sysroot\fR \fIDIR\fR]
 .br
@@ -78,6 +78,50 @@ official / third_party / verified / unverified / unknown. On pacman systems
 .PP
 Trust levels are mapped conservatively. APT with official keyring match -> OFFICIAL.
 APT signed-by non-distro -> THIRD_PARTY. Other managers only rise to OFFICIAL when verification is explicit.
+.PP
+A file no package owns can still reach PUBLISHER_SIGNED (its publisher's signed
+release list, verified under a key served by the publisher's host over TLS, names
+the file's hash) or PUBLISHER_HOSTED (an unsigned checksum list read over TLS from
+the publisher's host names it). See PUBLISHER VERIFICATION.
+.SH PUBLISHER VERIFICATION
+An executable that ends UNKNOWN, USER_LOCAL or USER_PKG is asked about its
+publisher. The file says where it came from: its install path (such as
+~/.local/share/NAME/versions/VERSION, the version-like component naming the
+version and the one before it the product), its ELF .note.package, Go build
+information, and the https addresses in its bytes (read in 1 MB chunks, at most
+1 GB and 15 s, cached per path, inode, size, mtime and ctime in
+~/.config/weird/claims.json).
+No publisher address is written into weird and the binary is never executed.
+Proof is looked for at BASE/VERSION/manifest.json, SHA256SUMS, checksums.txt,
+sha256sum.txt, BASE/manifest.json, BASE/latest/manifest.json and, for a GitHub
+repository, releases/download/vVERSION/SHA256SUMS and the like, each one small
+GET (TLS verified, same\-host redirects only, 5 MB lists, 64 KB keys, 20 s);
+.sig, .asc and .minisig next to a list are tried with keys from /keys/PRODUCT.asc,
+/PRODUCT.asc, /keys/release.asc, /release\-key.asc, /pgp\-key.asc, /KEYS and
+BASE/KEYS on the same host, then the key the signature names on keys.openpgp.org.
+A signature that verifies plus the file's sha256 (or sha512) in the list is
+PUBLISHER_SIGNED; an unsigned list over TLS with the hash is PUBLISHER_HOSTED; a
+list that should name the file and does not, or a signature that fails under the
+host's keys, is \fBpublisher_mismatch\fR (+60, T1554, verdict "Likely
+malicious"); nothing published, no network or \fB\-\-offline\fR leaves the file
+"unverifiable" (info, never scored, listed so on every run). Verified status is
+never inherited: every file is checked against its own published hash; only a
+manager's claim passes to a program under the identified binary's install root.
+The first
+key that verifies a host's list is pinned in ~/.config/weird/publishers/HOST/;
+a new key from the same host is accepted and reported once as medium
+\fBpublisher_key_changed\fR. Results are cached per file hash, 404s for a day,
+and new probes get eight seconds of network time per run (the rest is
+"verification pending" until the next run). The report's line for running
+programs names every program verified in the run. All of it depends on the one
+question weird ever asks, on the first
+run with a terminal: "weird can go online to check your software against
+publishers' signed lists and the known\-bad AUR list. OK? [Y/n]" (Enter means
+yes), stored as \fBonline\fR in ~/.config/weird/config.toml. Unanswered means
+offline and the report says "online checks not enabled: run weird once in a
+terminal to answer". The same switch gates the known\-bad list download and the
+description lookups; the baseline is recorded by every completed run without a
+question.
 .SH SIGNATURE VERIFICATION
 .TP
 .B APT
@@ -136,19 +180,17 @@ suppressed and tagged "build"; a shell, interpreter, curl or wget whose ancestor
 PDF viewer, office suite or mail client gains 30 points (T1204.002). Print them with
 \fBweird rules show \-\-defaults\fR; \fBdefaults = false\fR in rules.toml disables them.
 .SH BASELINE / DIFF
-On a terminal the first run asks once, after the report, whether to save it as
-the baseline (Enter means yes); the question follows the same rule as the
-known\-bad list question and a run without a terminal never writes one. From
-then on every run opens with a "Changes since DATE" section: programs not
-running when the baseline was saved (matched by executable path and user; medium
-when unpackaged or unknown, low for a locally built or language\-manager package,
-info when OFFICIAL), executables whose hash moved (medium, re\-read only when
-size or mtime changed, every file with \fB\-\-deep\fR), persistence entries
-added (medium) or removed (info) and targets whose hash moved (medium), foreign
-packages added (low), removed or rebuilt (info), and kernel posture rows that
-changed (medium). Medium and low rows count toward the summary and the exit
-status. The baseline is never updated by a run; \fB\-\-save\-baseline\fR
-accepts the current state and \fB\-\-no\-baseline\fR skips the comparison.
+Every completed run records its state in ~/.config/weird/baseline.json and the
+next run lists what changed since, without asking anything: programs not running
+at the previous run (matched by executable path and user; medium when unpackaged
+or unknown, low for a locally built or language\-manager package, info when
+OFFICIAL or verified with its publisher), executables whose hash moved (medium,
+re\-read only when size or mtime changed, every file with \fB\-\-deep\fR),
+persistence entries added (medium) or removed (info) and targets whose hash moved
+(medium), foreign packages added (low), removed or rebuilt (info), and kernel
+posture rows that changed (medium). Each change is listed once, by the run that
+first sees it. \fB\-\-no\-baseline\fR neither compares nor records;
+\fB\-\-save\-baseline\fR says that it saved.
 .PP
 The file is version 2: processes (process_key, exe realpath, sha256, size,
 mtime, uid, sanitized cmdline, package, trust level, provenance, evidence),
@@ -190,18 +232,19 @@ Enable with \fB--debug-log FILE\fR or WEIRD_DEBUG_LOG to troubleshoot failures.
 .SH COMMANDS
 .TP
 .B (default)
-One run, one report. Sections in order: self\-check lines when something is wrong,
+One run, one report, printed in one piece once every section has run: the
 process scan, AUR packages (foreign package list, known\-bad cross\-check, PKGBUILD
-analysis), persistence entries, kernel posture and findings, stale binaries (only
-when a process still runs a replaced file), hidden process cross\-views (the pid
-probe). The AUR, persistence and kernel sections run in threads while the process
-scan runs; the output order never changes. A section with nothing to show prints
-its header and one "nothing to report" line; the full tables, posture rows, info
-notes and the security banner appear with \fB\-v\fR and in the single \fBdev\fR
-commands. Ends with one summary line: "N to look at (c critical, m medium, l low),
-M entries are your own unpackaged software, I info (exit E)". Only "to look at"
-sets the exit status: 2 if any critical, 1 if any medium or warning, 0 otherwise,
-3 when a collector failed. \fB\-\-skip\fR \fISECTION\fR leaves a section out (processes,
+analysis), persistence entries, kernel posture and modules, stale binaries (only
+when a process still runs a replaced file) and the hidden process cross\-views.
+The AUR, persistence and kernel sections run in threads while the process scan
+runs. The report opens with one sentence about the machine, lists each item under
+"Act now" (critical), "Worth a look" (medium) or "Minor" (low) with a title that
+names the thing and a few plain sentences, and ends with "Everything else", one
+line per section. \fB\-v\fR adds the info items, a details line under each item
+(the check, the trust level, the ATT&CK id) and the kernel posture rows; a single
+\fBdev\fR section prints the same layout. Exit status: 2 if any critical item, 1
+if any medium one, 0 otherwise, 3 when a collector failed; minor items never
+change it. \fB\-\-skip\fR \fISECTION\fR leaves a section out (processes,
 aur, persist, kernel, stale, hidden; repeatable). \fB\-\-json\fR prints one object
 with a key per section plus "summary". \fB\-\-offline\fR \fISYSROOT\fR runs the
 live\-media checks (persist, integrity, aur) against a mounted disk with no process
@@ -297,10 +340,11 @@ in the JSON. It is \fBmedium\fR with a second signal: the launching file is
 under /etc or /usr, a restart loop keeps it alive through an unpackaged
 interpreter, or a temp\-dir or integrity hit (critical). A unit under
 /etc/systemd/system pointing at an unpackaged file under /usr/local stays
-medium ("system\-wide persistence of unpackaged code").
-The table lists critical and medium entries and ends with a count line split
-into critical, medium, your own unpackaged software and info;
-\fB\-\-all\fR lists everything, \fB\-\-json\fR prints host, timestamp,
+medium ("system\-wide persistence of unpackaged code"). Such a target outside
+the home that its publisher verifies is \fBinfo\fR, one only a package manager
+names is \fBlow\fR, and a publisher mismatch is \fBcritical\fR.
+Each entry above info is an item in the report, titled with what starts and
+when; \fB\-\-all\fR lists everything, \fB\-\-json\fR prints host, timestamp,
 entries (with the MITRE ATT&CK id per source) and counts. Exit status is 2
 with any critical entry, 1 with any medium one, 0 otherwise.
 .TP
@@ -338,9 +382,12 @@ must exist as a .ko, .ko.zst, .ko.xz or .ko.gz under /usr/lib/modules/RELEASE
 and be owned by a package, otherwise \fBcritical\fR "unowned module"; a module
 dkms built from a packaged source tree in /usr/src is info. A missing module
 directory for the running kernel while another kernel version is installed is
-"reboot pending" (info). /proc/sys/kernel/tainted is decoded: unsigned module
-(bit 13) is \fBmedium\fR, out\-of\-tree module (bit 12) low, or medium next to
-an unowned module, the rest info. With root and bpftool the loaded eBPF
+"reboot pending" (info). /proc/sys/kernel/tainted is decoded and each item
+names the modules behind it and where they came from: unsigned module (bit 13)
+is low when every one is a DKMS build from a package, \fBmedium\fR otherwise;
+out\-of\-tree module (bit 12) is info when every one comes from a package the
+distribution signed, low otherwise, medium next to an unowned module; the rest
+info. With root and bpftool the loaded eBPF
 programs are counted and kprobes or tracepoints at getdents or the tcp/udp
 seq_show functions are noted. A posture block precedes the findings: Secure
 Boot (SecureBoot efivar), lockdown, modules_disabled, sig_enforce,
@@ -515,9 +562,11 @@ systemd/weird.service and weird.timer run a daily scan with \fB\-\-journal\fR an
 Leave a section out of the default run: processes, aur, persist, kernel, stale
 or hidden. Repeatable.
 .TP
-.B \-\-offline \fISYSROOT\fR
-Live\-media mode: persist, executable integrity and aur against a mounted disk,
-with no process or hidden sections. Refuses / without \fB\-\-force\fR.
+.B \-\-offline [\fISYSROOT\fR]
+Alone: no network this run, whatever the stored online answer says (publisher
+lists, the known\-bad list and description lookups are not fetched). With a
+SYSROOT: live\-media mode, persist, executable integrity and aur against a
+mounted disk, with no process or hidden sections. Refuses / without \fB\-\-force\fR.
 .TP
 .B \-\-no\-prompt
 Never ask a question. weird asks two: whether to download the known\-bad AUR
@@ -550,12 +599,17 @@ Prefix for package databases and system configuration (/var/lib/pacman,
 /var/lib/dpkg, /etc, /usr/lib/modules and so on). Also read from
 WEIRD_SYSROOT. \fBoffline\fR sets it from its SYSROOT argument.
 .SH OUTPUT
-The table shows PID, weirdness score, trust level, process name, and a short
-description. If no description is found the table shows the verdict:
-"Unverified" (no provenance, no signals), "Suspicious" (one signal, or any
-signals on a process with known provenance) or "Likely malicious" (two or
-more signals, or memfd, deleted or masquerade on an unverified process).
-Each scoring reason is printed under the row with its MITRE ATT&CK technique.
+Each item names the thing it is about (a program by what it runs, a unit by what
+it starts, a package, a kernel module) and says in plain sentences what it is,
+why it is listed and what to do. A process with warning signs is titled by its
+most telling sign and explains every one. Its verdict is "Suspicious" (one
+signal, or any signal on a process with known provenance) or "Likely malicious"
+(two or more signals, or memfd, deleted or masquerade on an unverified process);
+\fBweird\fR \fIPID\fR says "looks suspicious" or "looks malicious". \fBweird\fR
+\fIPID\fR prints a verdict line, the warning signs, where the program came from
+and a short fact sheet (program, command, parent, user, memory, network,
+children); \fB\-v\fR adds its open files, the full process tree and the
+technical notes, including the MITRE ATT&CK techniques.
 .SH TRUST LEVELS
 Trust levels indicate provenance, not security. Examples:
 .TP
@@ -630,7 +684,17 @@ Trusted executable hashes written by \fBweird baseline trust\fR (0600).
 .TP
 .B ~/.config/weird/campaigns/
 The known\-bad AUR list (campaigns.json and the list files it names) with
-meta.json (sha256, size, newest campaign date), 0600, fetched only after a yes.
+meta.json (sha256, size, newest campaign date), 0600, fetched only when weird
+may go online.
+.TP
+.B ~/.config/weird/claims.json
+What each unpackaged executable says about its publisher, with its hashes, per
+path, size and mtime (0600).
+.TP
+.B ~/.config/weird/publishers/HOST/
+Per publisher host: gnupg/ (the private keyring, 0700), trust.json (pinned key
+fingerprints, first seen, products), verified.json (results by file sha256) and
+misses.json (404s, kept a day), all 0600.
 .TP
 .B systemd/weird.service, weird.timer
 Shipped user units for one daily full run.

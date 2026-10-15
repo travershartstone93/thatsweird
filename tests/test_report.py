@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 import re
+import socket
 import sys
 import unittest
 from unittest import mock
@@ -13,70 +14,59 @@ from fixtures import _write, make_proc, make_proc_root, make_stub_file  # noqa: 
 from test_persist import PersistBox  # noqa: E402
 
 CLEAN = """\
-== Processes ==
+Nothing weird on HOST.
+First run: weird saved what this machine looks like now, so the next run can
+show what changed.
 
-WARNING: pacman LocalFileSigLevel = Optional: locally built packages (makepkg/AUR) are installed unsigned
-nothing to report (1 process examined)
+Everything else
 
-== AUR packages ==
+  Running programs   1 checked.
+  AUR packages       None installed.
+  Startup programs   0 entries checked.
+  Kernel modules     None loaded. The kernel is untainted.
+  Hidden processes   Nothing hidden among 1 process.
 
-nothing to report (no foreign packages installed)
+Online checks are off: run weird once in a terminal and answer its one
+question to turn them on.
 
-== Persistence ==
-
-nothing to report (0 persistence entries checked, 0 your own unpackaged software, 0 info)
-
-== Kernel ==
-
-nothing to report (0 loaded modules, 0 owned by packages, taint clean)
-
-== Hidden processes ==
-
-nothing to report (1 pid listed, pids 1..5000 probed)
-
-summary: 0 to look at (0 critical, 0 medium, 0 low), 0 entries are your own unpackaged software, 6 info (exit 0)
+weird -v lists everything; weird 1234 explains process 1234.
 """
 
 DIRTY = """\
-== Processes ==
+3 things on HOST need you to act now.
+First run: weird saved what this machine looks like now, so the next run can
+show what changed.
 
-WARNING: pacman LocalFileSigLevel = Optional: locally built packages (makepkg/AUR) are installed unsigned
-nothing to report (2 processes examined)
+Act now
 
-== AUR packages ==
+  Every program loads /tmp/evil.so
+    /etc/ld.so.preload makes every program on this machine load /tmp/evil.so.
+    It lives in a temporary folder, where programs are not installed and
+    malware often hides. The library it names does not exist yet, so nothing
+    is loaded. If you did not set this up, treat it as serious.
 
-nothing to report (no foreign packages installed)
+  evil starts at boot
+    /etc/systemd/system/evil.service runs /tmp/evil. It lives in a temporary
+    folder, where programs are not installed and malware often hides. If you
+    did not set this up, treat it as serious.
 
-== Persistence ==
+  Hidden process: evil (pid 4242)
+    The kernel answers for pid 4242, but it is missing from the list that ps
+    and top read. Rootkits hide programs this way; treat it as serious. Run
+    weird 4242 for the full picture.
 
-SOURCE           FILE                                     TARGET                               TRUST        SEVERITY
---------------------------------------------------------------------------------------------------------------------
-ld.so.preload    /etc/ld.so.preload                       /tmp/evil.so                         UNKNOWN      critical
-                 line 1: /tmp/evil.so
-                 in a temporary directory, target does not exist [T1574.006]
-systemd service  /etc/systemd/system/evil.service         /tmp/evil                            UNKNOWN      critical
-                 ExecStart: /tmp/evil
-                 in a temporary directory, not owned by any package [T1543.002]
+Everything else
 
-3 persistence entries checked: 2 critical, 0 medium, 1 your own unpackaged software, 0 info (-v lists the info entries)
+  Running programs   2 checked.
+  AUR packages       None installed.
+  Startup programs   3 entries checked, 1 of them your own scripts.
+  Kernel modules     None loaded. The kernel is untainted.
+  Hidden processes   1 process listed.
 
-== Kernel ==
+Online checks are off: run weird once in a terminal and answer its one
+question to turn them on.
 
-nothing to report (0 loaded modules, 0 owned by packages, taint clean)
-
-== Hidden processes ==
-
-KIND                     DETAIL                                                           SEVERITY
---------------------------------------------------------------------------------------------------
-hidden pid               pid 4242 (evil): present in /proc but absent from the directory  critical [T1564.001]
-                         listing
-                         A rootkit that filters the /proc directory listing hides a
-                         process from ps and top, but /proc/<pid>/stat still answers a
-                         direct stat. This is what unhide does.
-
-1 pid listed, pids 1..5000 probed: 1 critical, 0 medium, 0 low
-
-summary: 3 to look at (3 critical, 0 medium, 0 low), 1 entry is your own unpackaged software, 6 info (exit 2)
+weird -v lists everything; weird 1234 explains process 1234.
 """
 
 
@@ -99,7 +89,8 @@ class ReportBox(PersistBox):
         with contextlib.redirect_stdout(out):
             code = self.weird.main(argv)
         text = re.sub(r"\x1b\[[0-9;]*m", "", out.getvalue())
-        return text.replace(str(self.home), "~").replace(str(self.sysroot), ""), code
+        text = text.replace(str(self.home), "~").replace(str(self.sysroot), "")
+        return text.replace(f" on {socket.gethostname()}", " on HOST"), code
 
 
 class CleanReport(ReportBox):
@@ -111,9 +102,9 @@ class CleanReport(ReportBox):
 
     def test_verbose_keeps_the_full_sections(self):
         text, code = self.report("-v")
-        self.assertIn("SECURITY NOTE", text)
-        self.assertIn("Posture", text)
-        self.assertIn("Every pid, thread and socket", text)
+        self.assertIn("secure boot:", text)
+        self.assertIn("bash (pid 100): It comes from the bash package", " ".join(text.split()))
+        self.assertIn("Nothing hidden among", " ".join(text.split()))
 
 
 class DirtyReport(ReportBox):

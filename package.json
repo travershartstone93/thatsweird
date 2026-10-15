@@ -1,6 +1,6 @@
 {
   "name": "thatsweird",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Process anomaly detector for Linux - identifies suspicious processes by analyzing provenance, behavior, and trust levels",
   "bin": {
     "weird": "./bin/weird"
@@ -36,7 +36,7 @@
     "node": ">=14"
   },
   "weirdIntegrity": {
-    "sha256": "94576b959ba115a657d8a435711812986a46169e785cf8471582f04715a8e82a",
-    "version": "1.4.0"
+    "sha256": "46f1faf977f5b1f18f8dcb8dfd7a93445681f17eb041b6872340d8ad71f438d1",
+    "version": "1.5.0"
   }
 }

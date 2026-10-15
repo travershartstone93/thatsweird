@@ -102,7 +102,7 @@ class RestartNeeded(StaleBox):
         make_proc(self.proc, 600, "/usr/bin/kwin_wayland", deleted=True, starttime=BEFORE, cgroup=SESSION)
         text, code = self.restart_needed()
         self.assertEqual(code, 1)
-        self.assertIn("systemctl --user restart dealscout.service", text)
+        self.assertIn("systemctl --user restart dealscout.service", " ".join(text.split()))
         self.assertIn("session-2.scope", text)
 
         text, code = self.restart_needed(json=True)
@@ -139,7 +139,7 @@ class RestartNeeded(StaleBox):
 
         text, code = self.restart_needed()
         self.assertEqual(code, 1)
-        self.assertIn("library libssl.so.3", text)
+        self.assertIn("the old libssl.so.3", " ".join(text.split()))
         self.assertIn("dealscout.service", text)
         self.assertNotIn("exe ", text)
 
@@ -148,7 +148,7 @@ class RestartNeeded(StaleBox):
         make_proc(self.proc, 500, "/usr/bin/python3", starttime=BEFORE, cgroup=DEALSCOUT)
         text, code = self.restart_needed()
         self.assertEqual(code, 0)
-        self.assertIn("nothing to restart", text.lower())
+        self.assertIn("nothing is running files an update replaced", " ".join(text.lower().split()))
 
         text, code = self.restart_needed(json=True)
         self.assertEqual(code, 0)
@@ -167,7 +167,7 @@ class RestartNeeded(StaleBox):
         self.assertEqual(code, 2)
         text, code = self.restart_needed()
         self.assertEqual(code, 0)
-        self.assertIn("nothing to restart", text.lower())
+        self.assertIn("nothing is running files an update replaced", " ".join(text.lower().split()))
 
 
 if __name__ == "__main__":

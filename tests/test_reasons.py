@@ -124,20 +124,19 @@ class JsonFields(ReasonBox):
 
 
 class TableReasons(ReasonBox):
-    def test_table_prints_reasons(self):
+    def test_report_items_explain_each_sign(self):
         self.clean()
         self.flagged()
-        processes, _, _ = self.weird.run_scan(scan_args(verbose=True))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            print(self.weird.format_process_table(processes))
-        lines = out.getvalue().splitlines()
-        row = next(i for i, line in enumerate(lines) if line.lstrip().startswith("700 "))
-        self.assertIn("- CRITICAL: Executing from memory (memfd/anonymous) (+60) [T1620]", lines[row + 1])
-        self.assertIn("Suspicious path /tmp/.x/helper (+30) [T1036.005]", lines[row + 2])
-        bash_row = next(i for i, line in enumerate(lines) if line.lstrip().startswith("100 "))
-        self.assertFalse(lines[bash_row + 1:bash_row + 2] and lines[bash_row + 1].lstrip().startswith("- "))
-        self.assertEqual(sum(1 for line in lines if line.lstrip().startswith("- ")), len(processes[0].reasons))
+            self.weird.cmd_scan(scan_args(verbose=True))
+        flat = " ".join(out.getvalue().split())
+        self.assertIn("helper (pid 700) runs from memory, with no file on disk", flat)
+        self.assertIn("It runs code straight from memory instead of a file on disk", flat)
+        self.assertIn("It runs from /tmp/.x/helper, where programs are not normally installed.", flat)
+        self.assertIn("T1620, T1036.005", flat)
+        self.assertIn("bash (pid 100): It comes from the bash package", flat)
+        self.assertEqual(flat.count("(pid 100)"), 1)
 
 
 if __name__ == "__main__":

@@ -158,7 +158,7 @@ class LocalBuild(ArchBox):
         as_json = self.weird.process_to_dict(proc)
         self.assertEqual(as_json["trust_level"], "LOCAL_BUILD")
         self.assertEqual(as_json["provenance"]["validation"], "none")
-        self.assertIn("LOCAL_BUILD", self.weird.format_process_table([proc]))
+        self.assertIn("trust LOCAL_BUILD", self.weird.process_details(proc))
         self.assertIn("makepkg", self.weird.format_process_detail(proc))
 
     def test_aur_package_still_scores_on_signals(self):
@@ -261,7 +261,7 @@ class SigLevelHonesty(ArchBox):
         self.assertEqual(describe("Required"), "packages and sync database signature checked")
         self.assertIn("not required", describe("Never"))
 
-    def test_localfilesiglevel_optional_warns(self):
+    def test_localfilesiglevel_is_not_in_the_process_scan(self):
         self.add_pkg("bash", "5.3.15-2", "/usr/bin/bash", repo="core", packager=CACHYOS)
         self.add_pkg("kwin", "6.5.0-1", "/usr/bin/kwin_wayland", repo="extra", packager=CACHYOS)
         make_proc(self.proc, 100, "/usr/bin/bash")
@@ -270,8 +270,7 @@ class SigLevelHonesty(ArchBox):
         with contextlib.redirect_stdout(out):
             self.weird.cmd_scan(scan_args(verbose=True))
         text = out.getvalue()
-        self.assertEqual(text.count("LocalFileSigLevel"), 1, text)
-        self.assertIn("installed unsigned", text)
+        self.assertNotIn("LocalFileSigLevel", text)
 
 
 class SigLevelDatabaseRequired(ArchBox):

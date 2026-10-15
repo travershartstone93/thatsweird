@@ -18,23 +18,32 @@ kernel sections run in threads while the process scan runs, so the whole report
 takes a few seconds; the output order never changes. While a section runs and
 stderr is a terminal, one line on stderr names the sections still running
 ("checking hidden processes... 3s"); it is cleared before the report prints and
-never written under `--json` or to a pipe. A section with nothing to
-show prints its header and one "nothing to report" line with its counts; the
-tables, the kernel posture rows, the info notes and the security banner appear
-with `-v` and in the single `weird dev` commands.
+never written under `--json` or to a pipe.
 
-The summary line reads
-`summary: N to look at (c critical, m medium, l low), M entries are your own
-unpackaged software, I info (exit E)`. "To look at" is what sets the exit
-status: 2 with any critical finding, 1 with any medium or warning one, 0 when
-clean and 3 when a collector failed (that section is reported as failed and the
-rest still prints). "Your own unpackaged software" counts the persistence
-entries in the yours tier (below); they never change the exit status. `--json`
-carries the same numbers under "summary", with "yours" as its own key.
+The report prints in one piece once every section has run. It opens with one
+sentence about the machine ("Nothing weird on whisper.", "2 things on whisper are
+worth a look, and 4 are minor. Nothing needs you to act now."), then a line
+naming the run it compares with, then the items grouped as "Act now" (critical),
+"Worth a look" (medium) and "Minor" (low). Each item is a title that names the
+real thing (a program by what it runs, a unit by the file it starts, a package,
+a kernel module) and a few plain sentences: what it is, why it is listed, what to
+do. "Everything else" closes the report with one line per section: how much was
+checked and, for running programs, which were verified with their publishers.
+Text wraps at 78 columns without splitting a path; colour is used only on a
+terminal. Info items appear only with `-v`, which also adds a dim details line
+under each item (the check, the trust level, the ATT&CK id), the kernel posture
+rows, and one line per process and startup entry. A single `weird dev` section
+prints the same layout for itself.
+
+Exit status: 2 with any critical item, 1 with any medium one, 0 otherwise, and 3
+when a collector failed (that section is reported as failed and the rest still
+prints); minor items never change it. "Your own scripts" counts the startup
+entries in the yours tier (below), which never change the exit status either.
+`--json` carries the counts under "summary", with "yours" as its own key.
 
 `--skip SECTION` leaves a section out (processes, aur, persist, kernel, stale,
-hidden; repeatable). `-v` shows every process, the info rows and the notes
-behind each finding. `--json` prints one object with a key per section plus
+hidden; repeatable). `-v` shows every process, the info items and the details
+behind each item. `--json` prints one object with a key per section plus
 "summary"; `--ndjson` is one line per process and covers the scan section only.
 `--deep` hashes every packaged executable (below) and makes the hidden section
 sweep every pid up to pid_max instead of stopping at the last pid assigned.
@@ -93,6 +102,91 @@ A mismatch is `integrity_modified` (+60, ATT&CK T1554) and the verdict is
 checked (no mtree, path not listed, unreadable) is reported as
 `unavailable` in the evidence and does not score. JSON output carries the
 result in the `integrity` field.
+
+## Publisher verification (a file no package owns)
+
+An executable with trust UNKNOWN, USER_LOCAL or USER_PKG (not a container
+process) is asked about its publisher. Discovery (`discover_publisher`) reads,
+in order: the install path (`~/.local/share/<name>/versions/<ver>`,
+`<root>/<name>/<ver>/bin/<x>`, `/opt/<name>/<ver>`, any version-like directory
+under the home, /usr/local or /opt: the version, and the product from the
+component before it), the ELF `.note.package` JSON (name, version), Go build
+information through `go version -m`, and a bounded scan of the file's bytes for
+https addresses (1 MB chunks, at most 1 GB and 15 s). Hosts, release bases
+(addresses whose path mentions releases, downloads, manifests, checksums or
+updates) and GitHub repositories are kept; product candidates come from the
+release path (`claude-code` from `claude-code-releases`), the install directory
+name, the note, the Go module and the file name. The claim, and the file's
+sha256 and sha512 once verification has hashed it, are cached per path, inode,
+size, mtime and ctime in `~/.config/weird/claims.json`, so a later run costs one
+stat; a file replaced, or rewritten with its mtime set back, gets a new ctime,
+which a user cannot forge. Hashing a large binary takes about a second, so an
+offline run hashes only when a result for that host is cached: the same bytes
+verified on an earlier run keep their tier offline. Nothing is ever executed,
+and no publisher address is written into weird.
+
+Verification (`verify_publisher`) tries, for each release base B and version V:
+`B/V/manifest.json`, `B/V/SHA256SUMS`, `B/V/checksums.txt`, `B/V/sha256sum.txt`,
+`B/manifest.json`, `B/latest/manifest.json`; for a GitHub repository
+`releases/download/v<V>/` (and without the v) `SHA256SUMS`, `checksums.txt`,
+`sha256sum.txt`, `<product>-<V>.sha256`, `SHA256SUMS.txt`. Each is one small
+GET through the same code as the known-bad list (TLS verified against the
+system store, redirects only to the same host, every resolved address tried,
+5 MB for lists and 64 KB for keys and signatures, 20 s). Next to a found list
+weird looks for `.sig` and `.asc` (and `.minisig` when minisign is installed);
+keys are tried at `/keys/<product>.asc` for every product candidate,
+`/<product>.asc`, `/keys/release.asc`, `/release-key.asc`, `/pgp-key.asc`,
+`/KEYS` and `B/KEYS` on the same host, then the key the signature names on
+keys.openpgp.org. Keys live in a private keyring per host,
+`~/.config/weird/publishers/<host>/gnupg` (0700), and gpg must report VALIDSIG.
+The file's hash is matched as hex text anywhere in the list, so manifest.json
+files and SHA256SUMS lines both work.
+
+The tiers: **signed** (PUBLISHER_SIGNED, a signature verifies under a key from
+the host and the hash is present), **hosted** (PUBLISHER_HOSTED, an unsigned
+list fetched over TLS from the publisher's host names the hash), **mismatch**
+(a list that should name the file does not, or a signature fails under the
+host's keys: `publisher_mismatch`, +60, T1554, verdict "Likely malicious"),
+**unverifiable** (nothing published, no network, offline, or a list that
+cannot contain the file: release archives only, an unknown format, the latest
+list of another version; info, never scored, and `weird PID` says why under
+"Where it came from") and **pending**
+(the run's eight seconds of network time for new probes are used up; checked
+next run). A verified tier is never inherited: every file, each Claude Code
+version included, is checked against its own published hash, so a file dropped
+next to a verified binary gains nothing from it. Only a manager's claim is handed
+down: a process whose executable lies under the install root of a binary a
+manager identified (USER_PKG; the versioned directory, a `lib/<name>` sibling
+under the same prefix, never a bare bin directory or the home) and that does not
+name its own version inherits that claim with evidence "inherits identified from
+<root>" (llama-server under /usr/local/lib/ollama follows ollama's Go build
+information).
+
+Per host, `~/.config/weird/publishers/<host>/` keeps `trust.json` (the pinned
+fingerprints, first seen, products; a new key from the same host is accepted
+and reported once as medium `publisher_key_changed`), `verified.json` (results
+by file sha256, so the same bytes are never verified twice; a mismatch is
+rechecked after a day) and `misses.json` (404s, kept a day). Every run names the
+programs verified with their publishers in its line for running programs, for
+example "Verified with their publishers: claude-code 2.1.291 and 2.1.296 (signed
+release list at downloads.claude.ai)."
+`weird PID` shows the result under "Publisher", `--json` under `publisher`
+(tier, host, product, version, manifest_url, key_fingerprint, detail,
+inherited_from).
+
+Whether any of this may use the network is the one question weird ever asks:
+"weird can go online to check your software against publishers' signed lists
+and the known-bad AUR list. OK? [Y/n]", on the first run with a terminal (Enter
+means yes, EOF means no for this run only), stored as `online = true|false` at
+the top of `~/.config/weird/config.toml`. Without a terminal, under `--json`,
+`--ndjson`, `watch`, `--no-prompt` or WEIRD_NO_PROMPT it is not asked, the run
+stays offline and the report (or the JSON `online` key) says "online checks not
+enabled: run weird once in a terminal to answer". `--offline` forces a run
+offline whatever is stored. The same switch gates the known-bad list download
+(fetched or refreshed silently when missing or older than
+campaigns_max_age_days) and the GitHub and npm description lookups. Since 1.5.0
+no other question exists: the baseline is recorded by every completed run and
+"Changes since <date>" means since the previous run.
 
 ## Restart needed (needrestart is not in the official Arch repositories)
 
@@ -156,13 +250,18 @@ integrity hit (critical, as above). A target that changed after the file that
 runs it is noted but stays info, because scripts are edited more often than
 units. A unit under /etc/systemd/system that points at an unpackaged file under
 /usr/local stays medium and says so: "system-wide persistence of unpackaged
-code". The count line splits the same way: critical, medium, your own
-unpackaged software, info. Each source carries its MITRE ATT&CK id in the JSON (T1543.002
+code". A target outside the home is also checked against its publisher (see
+the publisher verification section): verified is **info** with trust
+PUBLISHER_SIGNED or PUBLISHER_HOSTED, a target only a package manager names
+(Go build information, say) is **low**, a publisher mismatch is **critical**,
+and anything else keeps its severity, so a hand-written script in /usr/local
+stays medium. The section's summary line says how many entries were checked and how many
+are your own scripts. Each source carries its MITRE ATT&CK id in the JSON (T1543.002
 services, T1053.006 timers, T1053.003 cron, T1547.013 autostart, T1546.004 shell
 rc, T1574.006 ld.so.preload, T1546 udev and pacman hooks, T1195.001 makepkg.conf).
 
 ```bash
-weird dev persist          # critical and medium entries, then a count line
+weird dev persist          # the entries worth a look, then one summary line
 weird dev persist --all    # also list the entries that check out
 weird dev persist --json   # {host, timestamp, entries, counts}
 ```
@@ -269,9 +368,14 @@ hide from:
   info instead. When the directory for the running kernel is gone and a
   different kernel version is installed, that is "reboot pending" (info),
   because pacman removes the old module tree on a kernel upgrade.
-- taint: /proc/sys/kernel/tainted decoded bit by bit. Unsigned module (bit
-  13) is **medium**, out-of-tree module (bit 12) is low, or medium when an
-  unowned module is loaded as well; the rest are info.
+- taint: /proc/sys/kernel/tainted decoded bit by bit, each item naming the
+  modules behind it (read from /sys/module/NAME/taint) and where they came
+  from. Unsigned module (bit 13) is low when every unsigned module is a DKMS
+  build from a package (the text says when that package comes from the AUR)
+  and **medium** when one is not explained. Out-of-tree module (bit 12) is
+  info when every such module comes from a package your distribution signed,
+  low otherwise, and medium when an unowned module is loaded as well; the
+  rest are info.
 - eBPF: with root and bpftool, the loaded programs are counted and any kprobe
   or tracepoint whose name points at getdents or the tcp/udp seq_show
   functions is noted, since that is where an eBPF rootkit hooks.
@@ -594,12 +698,14 @@ its missing parts are simply not compared):
   ptrace_scope, core dumps, modprobe helper, kernel cmdline, LKRG).
 - `machine_id`, `timestamp`.
 
-With a baseline present the report opens with `== Changes since <date> ==`,
-a KIND / DETAIL / SEVERITY table like the other sections (info rows with
-`-v`), or "nothing changed (N processes, M persistence entries, K foreign
-packages, kernel posture compared)". The rows:
+With a baseline present the report says which run it compares with ("Compared
+with your last run on Oct 6 at 19:57."), lists each change with the other items
+under its urgency ("New since your last run: ...", "Changed since your last
+run: ..."; info ones with `-v`), and its "Changes" line under "Everything else"
+counts them, or reads "Nothing changed since ... (N processes, M persistence
+entries, K foreign packages, kernel posture compared)." The changes:
 
-- `new process` (a program not running when the baseline was saved, matched
+- `new process` (a program not running at the previous run, matched
   by executable path and user, so a second copy of a known program is not
   new): medium for USER_LOCAL, UNKNOWN and container processes, low for a
   LOCAL_BUILD, USER_PKG, Flatpak, Snap or AppImage program, info when
@@ -664,11 +770,17 @@ maps, or a JIT engine embedded in its executable).
 ## Files
 
 - `~/.config/weird/config.toml`: Policy configuration
+  (`signals.memfd_allow`: fnmatch patterns for memfd names your own tools
+  create, so a known sandbox or telemetry collector stays quiet, for
+  example `memfd_allow = ["my-collector*"]`)
 - `~/.config/weird/rules.toml`: User rules
 - `~/.config/weird/user_trusted.txt`: User trusted list
 - `~/.config/weird/cache/file_package_map.json`: File -> package cache
 - `~/.config/weird/baseline.json`: the baseline (version 2: processes, persistence entries, foreign packages, posture), 0600
 - `~/.config/weird/trusted.json`: Trusted executable hashes (`weird trust`)
 - `~/.config/weird/campaigns/`: known-bad AUR list (campaigns.json, the list files it names, meta.json), 0600
+- `~/.config/weird/claims.json`: what each unpackaged executable says about its publisher, with its hashes, per path, inode, size, mtime and ctime
+- `~/.config/weird/publishers/<host>/`: `gnupg/` keyring (0700), `trust.json` pinned keys, `verified.json` results by file hash, `misses.json` 404s (a day)
+- `~/.config/weird/config.toml` also holds `online = true|false`, the stored answer to the one question
 - `package.json` (`weirdIntegrity`): sha256 pin of `bin/weird`, refreshed by `scripts/update-pin.py`
 - `systemd/weird.service`, `weird.timer`: scheduled daily run

@@ -13,9 +13,13 @@
 # Alerts and findings go to the journal as SYSLOG_IDENTIFIER=weird (journalctl -t weird);
 # the JSON report on stdout is logged under weird-scan so it does not mix in.
 # Add --skip hidden to leave out the slow pid probe.
-# The run compares with ~/.config/weird/baseline.json and logs the changes to the
-# journal (WEIRD_COMMAND=changes). It never saves a baseline: a timer that accepted
-# every state would defeat the comparison. Accept one by hand with `weird --save-baseline`.
+# Each run logs what changed since the previous run (WEIRD_COMMAND=changes) and
+# then records the current state in ~/.config/weird/baseline.json, so a change is
+# reported once, by the run that first sees it.
+# WEIRD_NO_PROMPT keeps the unit from ever asking the one question weird has (may it
+# go online). Answer it once by running `weird` in a terminal: the answer is kept in
+# ~/.config/weird/config.toml and the timer follows it. Unanswered means offline, and
+# the JSON report says so under "online".
 
 [Unit]
 Description=weird anomaly report (processes, persistence, kernel, AUR, hidden)

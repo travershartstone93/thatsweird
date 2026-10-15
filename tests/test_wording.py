@@ -45,7 +45,6 @@ class Verdicts(ArchBox):
         make_proc(self.proc, 700, "/tmp/.x/helper", maps=MEMFD_MAPS)
 
         processes, _, _ = self.weird.run_scan(scan_args(verbose=True))
-        table = self.weird.format_process_table(processes, verbose=True)
         with mock.patch.object(self.weird, "get_process_description", return_value=None):
             detail = "\n".join(self.weird.format_process_detail(p) for p in processes)
         out = io.StringIO()
@@ -53,16 +52,12 @@ class Verdicts(ArchBox):
             self.weird.cmd_scan(scan_args(json=True, verbose=True))
         payload = json.loads(out.getvalue())
 
-        for text in (table, detail, out.getvalue()):
+        for text in (detail, out.getvalue()):
             self.assertNotIn("Likely Malware", text)
             self.assertNotIn("INVESTIGATE IMMEDIATELY", text)
-        rows = {int(line.split()[0]): line for line in table.splitlines() if line.split() and line.split()[0].isdigit()}
-        self.assertIn("(no description)", rows[600])
-        self.assertIn("Likely malicious", rows[700])
-        self.assertNotIn("Unverified", rows[100])
         verdicts = {p["pid"]: p["verdict"] for p in payload["processes"]}
         self.assertEqual(verdicts, {100: "", 600: "Unverified", 700: "Likely malicious"})
-        self.assertIn("no provenance: unverified, investigate if it also shows signals", detail)
+        self.assertIn("No package installed it and nothing vouches for it.", detail)
 
 
 if __name__ == "__main__":

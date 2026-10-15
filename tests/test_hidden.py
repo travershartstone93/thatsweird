@@ -54,9 +54,9 @@ class HiddenPids(HiddenBox):
         with self.hide(4242):
             out, code = self.hidden()
         self.assertEqual(code, 2)
-        self.assertIn("hidden pid", out)
-        self.assertIn("absent from the directory", out)
-        self.assertIn("unhide", out)
+        self.assertIn("Hidden process: evil (pid 4242)", " ".join(out.split()))
+        self.assertIn("missing from the list that ps and top read", " ".join(out.split()))
+        self.assertIn("Run weird 4242 for the full picture.", " ".join(out.split()))
 
     def test_no_hidden_pids(self):
         payload, code = self.hidden_json()
@@ -66,8 +66,7 @@ class HiddenPids(HiddenBox):
         self.assertEqual(payload["listed_pids"], 2)
         out, code = self.hidden()
         self.assertEqual(code, 0)
-        self.assertIn("Every pid, thread and socket", out)
-        self.assertIn("2 pids listed, pids 1..5000 probed", out)
+        self.assertIn("Nothing hidden among 2 processes.", " ".join(out.split()))
 
     def test_thread_id_is_not_a_hidden_process(self):
         make_proc(self.proc, 4300, "/usr/bin/bash", status_extra={"Tgid": "100"})
@@ -103,7 +102,9 @@ class HiddenPids(HiddenBox):
         with mock.patch.object(self.weird, "probe_pid", side_effect=original) as spy:
             out, _ = self.hidden()
         self.assertEqual(max(call.args[0] for call in spy.call_args_list), 6242)
-        self.assertIn("2 pids listed, pids 1..6242 probed", out)
+        verbose, _ = self.hidden(all=True)
+        self.assertIn("Process ids 1 to 6242 were checked.", " ".join(verbose.split()))
+        self.assertIn("Nothing hidden among 2 processes.", " ".join(out.split()))
         payload, _ = self.hidden_json()
         self.assertEqual((payload["pid_max"], payload["probed_to"]), (100000, 6242))
 

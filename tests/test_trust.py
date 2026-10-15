@@ -100,7 +100,8 @@ class TrustInScan(TrustBox):
         self.assertEqual(proc.weirdness_score, 0)
         self.assertEqual(proc.signal_keys, [])
         self.assertTrue(any(e.startswith("Trusted: executable hash recorded ") for e in proc.evidence), proc.evidence)
-        self.assertIn("[trusted]", self.weird.format_process_table([proc], verbose=True))
+        with mock.patch.object(self.weird, "get_process_description", return_value=None):
+            self.assertRegex(self.weird.format_process_detail(proc), r"Tags\s+trusted")
 
         out, code = self.baseline("diff")
         self.assertEqual(code, 0)

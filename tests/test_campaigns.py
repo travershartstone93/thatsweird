@@ -20,11 +20,6 @@ FIXTURE = Path(__file__).parent / "fixtures" / "campaigns" / "campaigns.json"
 INSTALLED = int(time.time()) - 100000
 
 
-class Tty(io.StringIO):
-    def isatty(self):
-        return True
-
-
 class CampaignBox(ArchBox):
     def setUp(self):
         super().setUp()
@@ -123,89 +118,68 @@ class MatchTests(CampaignBox):
         self.assertFalse([f for f in payload["findings"] if f["kind"] == "known-bad package"])
         self.assertEqual(code, 0)
         text, _ = self.aur_text(campaigns=str(FIXTURE))
-        self.assertIn("none of the 1 foreign packages is on any list", text)
+        self.assertIn("1 installed, none on the known-bad list.", " ".join(text.split()))
 
     def test_no_list_available(self):
         self.foreign("harmless")
         payload, code = self.aur_json()
-        self.assertEqual(payload["known_bad_list"], "not available (run interactively to fetch, or pass --campaigns PATH)")
+        self.assertEqual(payload["known_bad_list"],
+                         "not available (fetched when online checks are enabled, or pass --campaigns PATH)")
         self.assertFalse([f for f in payload["findings"] if f["kind"].startswith("known-bad")])
         self.assertEqual(code, 0)
         text, _ = self.aur_text()
-        self.assertIn("known-bad list: not available (run interactively to fetch, or pass --campaigns PATH)", text)
+        self.assertIn("The known-bad list is not available, so their names were not checked against it.", " ".join(text.split()))
 
 
-class PromptPolicyTests(CampaignBox):
-    def offer(self, tty, answer=None, **overrides):
-        asked, fetched = [], []
+class OnlinePolicyTests(CampaignBox):
+    """The list is refreshed without a question when weird may go online, and never otherwise."""
 
-        def ask(question):
-            asked.append(question)
-            if answer is None:
-                raise EOFError
-            return answer
+    def refresh(self, online, **overrides):
+        fetched = []
 
         def fetch():
             fetched.append(True)
             return self.weird.CAMPAIGNS_FILE
 
-        stdin = Tty() if tty else io.StringIO()
-        stdout = Tty() if tty else io.StringIO()
-        with mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stdout", stdout):
-            result = self.weird.maybe_offer_campaign_update(scan_args(**overrides), ask=ask, fetch=fetch)
-        return result, asked, fetched, stdout.getvalue()
+        with mock.patch.object(self.weird, "online_allowed", return_value=online), \
+                mock.patch("builtins.input", side_effect=AssertionError("a question was asked")):
+            result = self.weird.maybe_offer_campaign_update(scan_args(**overrides), fetch=fetch)
+        return result, fetched
 
     def cache(self, age_days):
         self.weird.CAMPAIGNS_DIR.mkdir(parents=True)
         self.weird.CAMPAIGNS_FILE.write_text(FIXTURE.read_text())
         self.weird.write_private_json(self.weird.CAMPAIGNS_META, {"fetched_at": int(time.time()) - age_days * 86400})
 
-    def test_no_tty_no_prompt(self):
-        result, asked, fetched, _ = self.offer(tty=False)
-        self.assertEqual((result, asked, fetched), (None, [], []))
+    def test_missing_list_is_fetched_when_online(self):
+        self.assertEqual(self.refresh(True), (self.weird.CAMPAIGNS_FILE, [True]))
 
-    def test_json_no_prompt(self):
-        for flag in ("json", "ndjson", "no_prompt", "watch"):
-            result, asked, fetched, _ = self.offer(tty=True, **{flag: True})
-            self.assertEqual((result, asked, fetched), (None, [], []), flag)
-        result, asked, fetched, _ = self.offer(tty=True, command="watch")
-        self.assertEqual((asked, fetched), ([], []))
-
-    def test_env_no_prompt(self):
-        os.environ["WEIRD_NO_PROMPT"] = "1"
-        try:
-            result, asked, fetched, _ = self.offer(tty=True)
-        finally:
-            del os.environ["WEIRD_NO_PROMPT"]
-        self.assertEqual((result, asked, fetched), (None, [], []))
-
-    def test_tty_missing_list_answer_no(self):
-        for answer in ("n", "", None):
-            result, asked, fetched, _ = self.offer(tty=True, answer=answer)
-            self.assertEqual(len(asked), 1, answer)
-            self.assertEqual(asked[0], "Known-bad AUR package list: not downloaded. Fetch it from "
-                                       "github.com/lenucksi/aur-malware-check? [y/N] ")
-            self.assertEqual((result, fetched), (None, []), answer)
-
-    def test_tty_stale_list_answer_yes(self):
+    def test_stale_list_is_refreshed_when_online(self):
         self.cache(age_days=9)
-        result, asked, fetched, _ = self.offer(tty=True, answer="y")
-        self.assertEqual(asked, ["Known-bad AUR package list: last updated 9 days ago. Update it? [y/N] "])
-        self.assertEqual(fetched, [True])
-        self.assertEqual(result, self.weird.CAMPAIGNS_FILE)
+        self.assertEqual(self.refresh(True), (self.weird.CAMPAIGNS_FILE, [True]))
 
-    def test_tty_fresh_list_no_prompt(self):
+    def test_fresh_list_is_kept(self):
         self.cache(age_days=2)
-        result, asked, fetched, _ = self.offer(tty=True, answer="y")
-        self.assertEqual((result, asked, fetched), (self.weird.CAMPAIGNS_FILE, [], []))
+        self.assertEqual(self.refresh(True), (self.weird.CAMPAIGNS_FILE, []))
 
-    def test_campaigns_path_used_without_prompt(self):
-        result, asked, fetched, _ = self.offer(tty=True, answer="y", campaigns=str(FIXTURE))
-        self.assertEqual((result, asked, fetched), (FIXTURE, [], []))
+    def test_offline_never_fetches(self):
+        self.assertEqual(self.refresh(False), (None, []))
+        self.cache(age_days=30)
+        self.assertEqual(self.refresh(False), (self.weird.CAMPAIGNS_FILE, []))
 
-    def test_fetch_campaigns_flag(self):
-        result, asked, fetched, _ = self.offer(tty=False, fetch_campaigns=True)
-        self.assertEqual((result, asked, fetched), (self.weird.CAMPAIGNS_FILE, [], [True]))
+    def test_campaigns_path_used_as_it_is(self):
+        self.assertEqual(self.refresh(True, campaigns=str(FIXTURE)), (FIXTURE, []))
+
+    def test_fetch_campaigns_flag_fetches_even_offline(self):
+        self.assertEqual(self.refresh(False, fetch_campaigns=True), (self.weird.CAMPAIGNS_FILE, [True]))
+
+    def test_no_terminal_means_offline_with_a_note(self):
+        fetched = []
+        with mock.patch.object(sys, "stdin", io.StringIO()), \
+                mock.patch("builtins.input", side_effect=AssertionError("asked without a terminal")):
+            result = self.weird.maybe_offer_campaign_update(scan_args(), fetch=lambda: fetched.append(True))
+        self.assertEqual((result, fetched), (None, []))
+        self.assertEqual(self.weird.online_note(), self.weird.ONLINE_NOTE)
 
     def test_fetch_failure_warns_and_continues(self):
         self.foreign("harmless")
@@ -216,7 +190,7 @@ class PromptPolicyTests(CampaignBox):
         with mock.patch.object(self.weird, "fetch_campaigns", failing):
             text, code = self.aur_text(fetch_campaigns=True)
         self.assertIn("known-bad list not fetched: no route to host", text)
-        self.assertIn("known-bad list: not available", text)
+        self.assertIn("The known-bad list is not available", " ".join(text.split()))
         self.assertEqual(code, 0)
         self.assertFalse(self.weird.CAMPAIGNS_FILE.exists())
 
@@ -295,6 +269,7 @@ class WholeRunFetchTests(CampaignBox):
 
     def test_failed_explicit_fetch_never_prompts(self):
         self.foreign("harmless")
+        self.weird.set_config_value("online", True)
         asked = []
 
         def failing(*a, **k):
@@ -316,7 +291,7 @@ class WholeRunFetchTests(CampaignBox):
         text = out.getvalue()
         self.assertEqual(asked, [], text)
         self.assertEqual(text.count("known-bad list not fetched"), 1, text)
-        self.assertIn("known-bad list: not available", text)
+        self.assertIn("The known-bad list is not available", " ".join(text.split()))
         self.assertIn(code, (0, 1))
 
 

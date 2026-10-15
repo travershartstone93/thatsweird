@@ -150,8 +150,7 @@ class DefaultRules(RuleBox):
         self.assertEqual(proc.signal_keys, [])
         self.assertIn("Rule aur-helper-build: suppressed under makepkg", proc.evidence)
         self.assertEqual(alerts, [])
-        table = self.weird.format_process_table([proc], verbose=True)
-        self.assertIn("[build]", table)
+        self.assertRegex(self.weird.format_process_detail(proc), r"Tags\s+build")
 
     def test_same_binary_outside_a_build_is_alerted(self):
         self.build_tree(chain_root_is_paru=False)
@@ -187,6 +186,41 @@ class DefaultRules(RuleBox):
         template = tomllib.loads(self.weird.RULES_TEMPLATE)
         self.assertTrue(any("parent" in r for r in template["rules"]))
         self.assertTrue(any("direct_parent" in r for r in template["rules"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class MemfdAllow(RuleBox):
+    def test_memfd_allow_pattern_quiets_a_known_tool(self):
+        w = self.weird
+        w._policy_cache = None
+        policy = w.load_policy()
+        self.addCleanup(setattr, w, "_policy_cache", None)
+        policy["signals"]["memfd_allow"] = ["sandbox-telemetry*"]
+        self.assertTrue(w._is_legitimate_memfd("/memfd:sandbox-telemetry-7 (deleted)"))
+        self.assertFalse(w._is_legitimate_memfd("/memfd:dropper (deleted)"))
+        policy["signals"]["memfd_allow"] = []
+        self.assertFalse(w._is_legitimate_memfd("/memfd:sandbox-telemetry-7 (deleted)"))
+
+
+class ScoreScale(RuleBox):
+    def test_score_never_exceeds_its_printed_scale(self):
+        """Every red flag at once still prints as at most 100/100."""
+        w = self.weird
+        proc = w.ProcessInfo(pid=4242, name="dropper", path="/memfd: (deleted)", cmdline="./dropper", uid=1000)
+        for field, value in [
+            ("is_memfd", True), ("is_deleted", True), ("is_stale", False),
+            ("env_suspicious", ["LD_PRELOAD=/tmp/x.so"]),
+            ("memfd_evidence", ["memfd executable mapping: /memfd:x"]),
+        ]:
+            if hasattr(proc, field):
+                setattr(proc, field, value)
+        score = w.calculate_weirdness_score(proc, set())
+        self.assertLessEqual(score, 100)
+        # and the cap is reachable, not just an idle bound
+        self.assertGreaterEqual(score, 50)
 
 
 if __name__ == "__main__":

@@ -138,6 +138,25 @@ class Modules(KernelBox):
         self.assertEqual(payload["modules"]["dkms"], 1)
         self.assertEqual(self.by_kind(payload, "out-of-tree module")[0]["severity"], "low")
 
+    def test_taint_items_name_their_modules_and_where_they_came_from(self):
+        make_stub_file(self.sysroot, f"/usr/lib/modules/{RELEASE}/updates/dkms/msi-ec.ko.zst")
+        make_pacman_pkg(self.sysroot, "msi-ec-dkms", "1.0-1", ["/usr/src/msi-ec-1.0/dkms.conf"],
+                        validation="none", packager="Unknown Packager")
+        self.loaded(["nvidia", "msi_ec"])
+        _write(self.sysroot / "sys/module/nvidia/taint", "O\n")
+        _write(self.sysroot / "sys/module/msi_ec/taint", "OE\n")
+        self.taint(12288)
+        payload, code = self.kernel_json()
+        self.assertEqual(code, 0, payload["findings"])
+        unsigned = self.by_kind(payload, "unsigned module")[0]
+        self.assertEqual((unsigned["severity"], unsigned["title"]), ("low", "Unsigned driver loaded: msi_ec"))
+        self.assertIn("msi-ec-dkms, a package from the AUR rather than a signed repository", unsigned["text"])
+        out_of_tree = self.by_kind(payload, "out-of-tree module")[0]
+        self.assertEqual(out_of_tree["severity"], "info")
+        self.assertIn("nvidia comes from the linux package, signed by your distribution", out_of_tree["text"])
+        out, _ = self.kernel()
+        self.assertNotIn("built outside the kernel", out)
+
 
 class Taint(KernelBox):
     def test_taint_bits_decoded(self):
@@ -179,9 +198,9 @@ class UpgradePending(KernelBox):
         self.assertTrue(payload["modules"]["reboot_pending"])
         with mock.patch.object(self.weird, "running_kernel", return_value="6.0.9-x"):
             out, code = self.kernel()
-        self.assertIn("reboot pending", out)
+        self.assertIn("A reboot is pending", " ".join(out.split()))
         self.assertIn("running kernel               6.0.9-x", out)
-        self.assertIn("ownership will be checked after the reboot", out)
+        self.assertIn("so they are checked after the reboot", " ".join(out.split()))
 
     def test_upgrade_pending_with_unsigned_taint_is_exit_1(self):
         self.taint(8192)
@@ -199,7 +218,7 @@ class Quiet(KernelBox):
         self.assertIn("bpftool unavailable or not root", payload["findings"][0]["detail"])
         out, code = self.kernel()
         self.assertEqual(code, 0)
-        self.assertIn("Every loaded module is visible in all views", out)
+        self.assertIn("1 loaded: 1 from packages. The kernel is untainted.", " ".join(out.split()))
         self.assertIn("taint                        0 (clean)", out)
         self.assertIn("1 in /proc/modules, 1 in /sys/module, 1 in kallsyms; 1 owned by packages, 0 dkms, 0 unowned", out)
 
@@ -275,7 +294,9 @@ class Lkrg(KernelBox):
         self.assertIn("sig_enforce", hit[0]["detail"])
         out, _ = self.kernel()
         self.assertIn("LKRG                         not present", out)
-        self.assertIn("note: hardening:", out)
+        self.assertIn("weird -v lists everything", out)
+        out, _ = self.kernel(all=True)
+        self.assertIn("Root can load new kernel code at any time", " ".join(out.split()))
 
     def test_lkrg_in_sys_module_is_active(self):
         _write(self.sysroot / "sys/module/lkrg/parameters/log_level", "3\n")

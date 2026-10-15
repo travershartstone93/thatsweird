@@ -15,10 +15,21 @@ _counter = itertools.count()
 
 
 def sandbox_root() -> str:
-    """A scratch directory that is not under /tmp, for sandboxes whose home paths get scanned."""
-    root = REPO / "tests" / ".sandbox"
-    root.mkdir(exist_ok=True)
-    return str(root)
+    """A scratch directory whose path never trips the suspicious-path check.
+
+    The repo-relative default breaks when the repo itself is cloned under
+    /tmp, so any base under a suspicious prefix is rejected and the user
+    cache is used instead. A clone anywhere must pass its own tests.
+    """
+    # Mirrors the policy defaults: suspicious prefixes plus the /.cache/
+    # contains-check, which rules the user cache out as a fallback too.
+    hot = ("/tmp/", "/var/tmp/", "/dev/shm/")
+    for base in (REPO / "tests" / ".sandbox",
+                 Path.home() / ".local" / "state" / "weird-tests" / "sandbox"):
+        if not (str(base) + "/").startswith(hot) and "/.cache/" not in str(base) + "/":
+            base.mkdir(parents=True, exist_ok=True)
+            return str(base)
+    raise RuntimeError("no sandbox location outside the suspicious-path prefixes")
 
 
 def load_weird(home: Path, proc_root: Optional[Path] = None, sysroot: Optional[Path] = None) -> Any:
